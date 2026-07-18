@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menuconfig TRANSACTIONS
+	bool "System transactions"
+	depends on X86_64 && SMP
+	help
+	  Enable system transaction support.
+
+if TRANSACTIONS
+
+config TRANSACTIONS_DEBUG
+	bool "System transaction invariant checks"
+	depends on DEBUG_KERNEL
+	help
+	  Enable extra checks for transaction state and object ownership.
+	  This is intended for development and debugging.
+
+config TRANSACTIONS_KUNIT_TEST
+	tristate "System transactions KUnit tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Run KUnit tests for the core transaction lifecycle.
+
+endif

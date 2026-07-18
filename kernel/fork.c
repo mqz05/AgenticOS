@@ -101,6 +101,7 @@
 #include <linux/bpf.h>
 #include <linux/stackprotector.h>
 #include <linux/user_events.h>
+#include <linux/transaction.h>
 #include <linux/iommu.h>
 #include <linux/rseq.h>
 #include <uapi/linux/pidfd.h>
@@ -907,6 +908,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	clear_tsk_need_resched(tsk);
 	set_task_stack_end_magic(tsk);
 	clear_syscall_work_syscall_user_dispatch(tsk);
+	transaction_task_init(tsk);
 
 #ifdef CONFIG_STACKPROTECTOR
 	tsk->stack_canary = get_random_canary();
@@ -2009,6 +2011,9 @@ __latent_entropy struct task_struct *copy_process(
 	spin_unlock_irq(&current->sighand->siglock);
 	retval = -ERESTARTNOINTR;
 	if (task_sigpending(current))
+		goto fork_out;
+	retval = transaction_task_fork(current);
+	if (retval)
 		goto fork_out;
 
 	retval = -ENOMEM;

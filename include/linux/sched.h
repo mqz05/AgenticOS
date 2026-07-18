@@ -86,6 +86,7 @@ struct signal_struct;
 struct task_delay_info;
 struct task_group;
 struct task_struct;
+struct transaction;
 struct user_event_mm;
 
 #include <linux/sched/ext.h>
@@ -1191,6 +1192,12 @@ struct task_struct {
 
 	/* Open file information: */
 	struct files_struct		*files;
+
+#ifdef CONFIG_TRANSACTIONS
+	/* System transaction associated with this task. */
+	struct transaction		*transaction;
+	struct list_head		transaction_entry; // Lets transaction->tasks to point back to this task struct
+#endif
 
 #ifdef CONFIG_IO_URING
 	struct io_uring_task		*io_uring;

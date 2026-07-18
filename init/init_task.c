@@ -128,6 +128,10 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.thread		= INIT_THREAD,
 	.fs		= &init_fs,
 	.files		= &init_files,
+#ifdef CONFIG_TRANSACTIONS
+	.transaction	= NULL,
+	.transaction_entry = LIST_HEAD_INIT(init_task.transaction_entry),
+#endif
 #ifdef CONFIG_IO_URING
 	.io_uring	= NULL,
 #endif
