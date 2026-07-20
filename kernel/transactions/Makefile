@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
 
-obj-y += object.o transaction.o
+obj-y += object.o skiplist.o transaction.o
 
-obj-$(CONFIG_TRANSACTIONS_KUNIT_TEST) += transaction_test.o
+obj-$(CONFIG_TRANSACTIONS_KUNIT_TEST) += skiplist_test.o transaction_test.o

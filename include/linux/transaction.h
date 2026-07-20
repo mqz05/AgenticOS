@@ -10,6 +10,10 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
+#ifdef CONFIG_TRANSACTIONS
+#include <linux/skiplist.h>
+#endif
+
 struct task_struct;
 struct transaction;
 
@@ -34,44 +38,43 @@ enum unsupported_behavior {
 };
 
 /*
- * A transaction begins with one task and may later be shared with tasks
- * created inside it. The object list remains empty until object adapters are
- * introduced.
+ * A transaction begins with one task. Sharing it with additional tasks is
+ * deferred until task checkpoint and rollback support is available.
  */
 struct transaction {
-	/* The tasks associated with this transaction. */
+	// The tasks associated with this transaction (only one for now)
 	struct list_head tasks;
 	atomic_t task_count;
 
-	/* Used for lifetime management, including wait-queue users. */
+	// Used for lifetime management, including wait-queue users.
 	refcount_t ref_count;
 
-	/* Transaction status word. */
+	// Transaction status word.
 	atomic_t status;
 
-	/* Automatic retry policy and transaction timestamp. */
+	// Automatic retry policy and transaction timestamp.
 	int autoretry;
 	u64 timestamp;
 
-	/* Number of retries. */
+	// Number of retries.
 	unsigned int count;
 
-	/* Abort and return an error after an explicit abort. */
+	// Abort and return an error after an explicit abort.
 	bool abortWithErr;
 
-	/* What to do on an unsupported operation. */
+	// What to do on an unsupported operation.
 	enum unsupported_behavior unsupported_operation_action;
 
-	struct list_head object_list;
+	struct skiplist_head object_list;
 	spinlock_t workset_lock;
 
-	/* The wait queue for loser transactions. */
+	// The wait queue for loser transactions.
 	wait_queue_head_t losers;
 
-	/* The wait queue for commit. */
+	// The wait queue for commit.
 	wait_queue_head_t siblings;
 
-	/* Protects the tasks list. */
+	// Protects the tasks list.
 	spinlock_t lock;
 };
 
@@ -100,13 +103,51 @@ enum transaction_object_type {
  * the native kernel subsystem.
  */
 struct transaction_object {
-	raw_spinlock_t lock;
 	enum transaction_object_type type;
+	struct transaction *writer;
+	struct list_head readers;
+	spinlock_t lock;
 	u64 version;
 };
 
-void transaction_object_init(struct transaction_object *object,
-			     enum transaction_object_type type);
+// An entry in a transaction's working set.
+struct txobj_thread_list_node {
+	// This is how we connect to the workset.
+	struct skiplist_head workset_list;
+
+	// This is how we connect to the object's reader list.
+	struct list_head object_list;
+	struct transaction *tx;
+	enum transaction_object_type type;
+	void *shadow_obj;
+	void *orig_obj;
+	struct transaction_object *tx_obj;
+	enum transaction_access_mode rw;
+	int (*validate)(struct txobj_thread_list_node *node);
+	int (*lock)(struct txobj_thread_list_node *node, int blocking);
+	int (*unlock)(struct txobj_thread_list_node *node, int blocking);
+	int (*commit)(struct txobj_thread_list_node *node);
+	int (*abort)(struct txobj_thread_list_node *node);
+	int (*release)(struct txobj_thread_list_node *node, int early);
+};
+
+void transaction_object_init(struct transaction_object *object, enum transaction_object_type type);
+
+struct txobj_thread_list_node *transaction_workset_node_alloc(void *shadow_obj,
+                                                              void *orig_obj,
+                                                              struct transaction_object *tx_obj,
+                                                              enum transaction_object_type type,
+                                                              enum transaction_access_mode rw,
+                                                              gfp_t gfp);
+void transaction_workset_node_free(struct txobj_thread_list_node *node);
+int transaction_workset_add(struct transaction *transaction, struct txobj_thread_list_node *node);
+struct txobj_thread_list_node *transaction_workset_find_orig(struct transaction *transaction,
+                                                             const void *orig_obj);
+struct txobj_thread_list_node *transaction_workset_find_object(struct transaction *transaction,
+                                                               struct transaction_object *tx_obj);
+struct txobj_thread_list_node *transaction_workset_remove(struct transaction *transaction,
+                                                          struct txobj_thread_list_node *node);
+bool transaction_workset_empty(struct transaction *transaction);
 
 struct transaction *transaction_alloc(gfp_t gfp);
 struct transaction *transaction_get(struct transaction *transaction);
@@ -124,8 +165,7 @@ int abort_transaction(struct transaction *transaction);
 int end_transaction(struct transaction *transaction);
 
 void transaction_task_init(struct task_struct *task);
-int transaction_attach_task(struct transaction *transaction,
-			    struct task_struct *task);
+int transaction_attach_task(struct transaction *transaction, struct task_struct *task);
 void transaction_detach_task(struct task_struct *task);
 void transaction_task_exit(struct task_struct *task);
 int transaction_task_fork(const struct task_struct *task);

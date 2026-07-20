@@ -20,6 +20,6 @@ config TRANSACTIONS_KUNIT_TEST
 	depends on KUNIT
 	default KUNIT_ALL_TESTS
 	help
-	  Run KUnit tests for the core transaction lifecycle.
+	  Run KUnit tests for transaction implementation.
 
 endif

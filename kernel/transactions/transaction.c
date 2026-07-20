@@ -1,15 +1,214 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Core system-transaction lifecycle. */
+// Core system-transaction lifecycle.
 
 #include <linux/atomic.h>
+#include <linux/bug.h>
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/transaction.h>
 
-/* The timestamp orders transactions that contend for the same object. */
+// The timestamp orders transactions that contend for the same object.
 static atomic64_t timestamp_counter = ATOMIC64_INIT(0);
+
+// Sort the workset by the original object's kernel virtual address.
+static int transaction_workset_compare(const struct skiplist_head *left,
+                                       const struct skiplist_head *right) {
+	const struct txobj_thread_list_node *left_node;
+	const struct txobj_thread_list_node *right_node;
+	unsigned long left_address;
+	unsigned long right_address;
+
+	left_node = skiplist_entry(left,
+					       struct txobj_thread_list_node,
+					       workset_list);
+	right_node = skiplist_entry(right,
+						struct txobj_thread_list_node,
+						workset_list);
+	left_address = (unsigned long)left_node->orig_obj;
+	right_address = (unsigned long)right_node->orig_obj;
+
+	if (left_address < right_address)
+		return -1;
+	if (left_address > right_address)
+		return 1;
+
+	return 0;
+}
+
+// Allocate and initialize the common fields of a workset entry.
+struct txobj_thread_list_node *transaction_workset_node_alloc(void *shadow_obj,
+                                                              void *orig_obj,
+                                                              struct transaction_object *tx_obj,
+                                                              enum transaction_object_type type,
+                                                              enum transaction_access_mode rw,
+                                                              gfp_t gfp) {
+	struct txobj_thread_list_node *node;
+
+	node = kzalloc(sizeof(*node), gfp);
+	if (!node)
+		return NULL;
+
+	skiplist_init_node(&node->workset_list);
+	INIT_LIST_HEAD(&node->object_list);
+	node->type = type;
+	node->shadow_obj = shadow_obj;
+	node->orig_obj = orig_obj;
+	node->tx_obj = tx_obj;
+	node->rw = rw;
+
+	return node;
+}
+EXPORT_SYMBOL_GPL(transaction_workset_node_alloc);
+
+// Free a workset entry only after it has been detached from both lists.
+void transaction_workset_node_free(struct txobj_thread_list_node *node) {
+	if (!node)
+		return;
+	if (WARN_ON_ONCE(node->tx ||
+			 skiplist_linked(&node->workset_list) ||
+			 !list_empty(&node->object_list)))
+		return;
+
+	kfree(node);
+}
+EXPORT_SYMBOL_GPL(transaction_workset_node_free);
+
+// Find an original object while the caller holds workset_lock.
+static struct txobj_thread_list_node *transaction_workset_find_orig_locked(struct transaction *transaction,
+                                                                           const void *orig_obj) {
+	struct txobj_thread_list_node *node;
+	unsigned long address = (unsigned long)orig_obj;
+
+	skiplist_for_each_entry(node, &transaction->object_list,
+					    workset_list) {
+		unsigned long node_address = (unsigned long)node->orig_obj;
+
+		if (node_address == address)
+			return node;
+		if (node_address > address)
+			break;
+	}
+
+	return NULL;
+}
+
+// Find a transactional object while the caller holds workset_lock.
+static struct txobj_thread_list_node *transaction_workset_find_object_locked(struct transaction *transaction,
+                                                                             struct transaction_object *tx_obj) {
+	struct txobj_thread_list_node *node;
+
+	skiplist_for_each_entry(node, &transaction->object_list,
+					    workset_list) {
+		if (node->tx_obj == tx_obj)
+			return node;
+	}
+
+	return NULL;
+}
+
+// Add one object to an active transaction's ordered workset.
+int transaction_workset_add(struct transaction *transaction, struct txobj_thread_list_node *node) {
+	int ret;
+
+	if (!transaction || !node || !node->orig_obj || !node->tx_obj)
+		return -EINVAL;
+	if (node->tx || skiplist_linked(&node->workset_list) ||
+	    !list_empty(&node->object_list))
+		return -EBUSY;
+
+	spin_lock(&transaction->workset_lock);
+	if (transaction_status(transaction) != TRANSACTION_ACTIVE) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (transaction_workset_find_object_locked(transaction, node->tx_obj)) {
+		ret = -EEXIST;
+		goto out;
+	}
+
+	ret = skiplist_insert(&node->workset_list,
+					  &transaction->object_list,
+					  transaction_workset_compare);
+	if (!ret)
+		node->tx = transaction;
+out:
+	spin_unlock(&transaction->workset_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(transaction_workset_add);
+
+// Look up a workset entry by its stable original object.
+struct txobj_thread_list_node *transaction_workset_find_orig(struct transaction *transaction,
+                                                             const void *orig_obj) {
+	struct txobj_thread_list_node *node;
+
+	if (!transaction || !orig_obj)
+		return NULL;
+
+	spin_lock(&transaction->workset_lock);
+	node = transaction_workset_find_orig_locked(transaction, orig_obj);
+	spin_unlock(&transaction->workset_lock);
+
+	return node;
+}
+EXPORT_SYMBOL_GPL(transaction_workset_find_orig);
+
+// Look up a workset entry given a transaction object.
+struct txobj_thread_list_node *transaction_workset_find_object(struct transaction *transaction,
+                                                               struct transaction_object *tx_obj) {
+	struct txobj_thread_list_node *node;
+
+	if (!transaction || !tx_obj)
+		return NULL;
+
+	spin_lock(&transaction->workset_lock);
+	node = transaction_workset_find_object_locked(transaction, tx_obj);
+	spin_unlock(&transaction->workset_lock);
+
+	return node;
+}
+EXPORT_SYMBOL_GPL(transaction_workset_find_object);
+
+// Detach a workset entry without releasing the entry or its shadow object.
+struct txobj_thread_list_node *transaction_workset_remove(struct transaction *transaction,
+                                                          struct txobj_thread_list_node *node) {
+	struct txobj_thread_list_node *removed = NULL;
+
+	if (!transaction || !node)
+		return NULL;
+
+	spin_lock(&transaction->workset_lock);
+	if (node->tx != transaction ||
+	    !skiplist_linked(&node->workset_list))
+		goto out;
+
+	skiplist_del(&node->workset_list,
+				 &transaction->object_list);
+	node->tx = NULL;
+	removed = node;
+out:
+	spin_unlock(&transaction->workset_lock);
+
+	return removed;
+}
+EXPORT_SYMBOL_GPL(transaction_workset_remove);
+
+bool transaction_workset_empty(struct transaction *transaction) {
+	bool empty;
+
+	if (!transaction)
+		return true;
+
+	spin_lock(&transaction->workset_lock);
+	empty = skiplist_empty(&transaction->object_list);
+	spin_unlock(&transaction->workset_lock);
+
+	return empty;
+}
+EXPORT_SYMBOL_GPL(transaction_workset_empty);
 
 struct transaction *transaction_alloc(gfp_t gfp) {
 	struct transaction *transaction;
@@ -23,7 +222,7 @@ struct transaction *transaction_alloc(gfp_t gfp) {
 	refcount_set(&transaction->ref_count, 1);
 	atomic_set(&transaction->status, TRANSACTION_INACTIVE);
 	transaction->unsupported_operation_action = UNSUPPORTED_ABORT;
-	INIT_LIST_HEAD(&transaction->object_list);  // TODO: replace with skip list
+	skiplist_init_head(&transaction->object_list);
 	spin_lock_init(&transaction->workset_lock);
 	init_waitqueue_head(&transaction->losers);
 	init_waitqueue_head(&transaction->siblings);
@@ -42,8 +241,14 @@ struct transaction *transaction_get(struct transaction *transaction) {
 EXPORT_SYMBOL_GPL(transaction_get);
 
 void transaction_put(struct transaction *transaction) {
-	if (transaction && refcount_dec_and_test(&transaction->ref_count))
+	if (!transaction)
+		return;
+
+	if (refcount_dec_and_test(&transaction->ref_count)) {
+		if (WARN_ON_ONCE(!transaction_workset_empty(transaction)))
+			return;
 		kfree(transaction);
+	}
 }
 EXPORT_SYMBOL_GPL(transaction_put);
 
@@ -52,8 +257,7 @@ void transaction_task_init(struct task_struct *task) {
 	INIT_LIST_HEAD(&task->transaction_entry);
 }
 
-int transaction_attach_task(struct transaction *transaction,
-			    struct task_struct *task) {
+int transaction_attach_task(struct transaction *transaction, struct task_struct *task) {
 	int ret = 0;
 
 	if (!transaction || !task)
@@ -62,6 +266,10 @@ int transaction_attach_task(struct transaction *transaction,
 	spin_lock(&transaction->lock);
 	if (READ_ONCE(task->transaction)) {
 		ret = -EBUSY;
+		goto out;
+	}
+	if (atomic_read(&transaction->task_count)) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
 
@@ -207,6 +415,10 @@ int end_transaction(struct transaction *transaction) {
 	status = atomic_cmpxchg(&transaction->status, TRANSACTION_ACTIVE,
 				TRANSACTION_COMMITTING);
 	if (status == TRANSACTION_ACTIVE) {
+		if (!transaction_workset_empty(transaction)) {
+			atomic_set(&transaction->status, TRANSACTION_ACTIVE);
+			return -EBUSY;
+		}
 		terminate_transaction(transaction);
 		return 0;
 	}
@@ -214,6 +426,10 @@ int end_transaction(struct transaction *transaction) {
 	if (status == TRANSACTION_ABORTED &&
 	    atomic_cmpxchg(&transaction->status, TRANSACTION_ABORTED,
 			   TRANSACTION_ABORTING) == TRANSACTION_ABORTED) {
+		if (!transaction_workset_empty(transaction)) {
+			atomic_set(&transaction->status, TRANSACTION_ABORTED);
+			return -EBUSY;
+		}
 		transaction->count++;
 		terminate_transaction(transaction);
 		return -ECANCELED;
