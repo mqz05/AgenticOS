@@ -857,9 +857,15 @@ __SYSCALL(__NR_open_tree_attr, sys_open_tree_attr)
 __SYSCALL(__NR_file_getattr, sys_file_getattr)
 #define __NR_file_setattr 469
 __SYSCALL(__NR_file_setattr, sys_file_setattr)
+#define __NR_xbegin 470
+__SYSCALL(__NR_xbegin, sys_xbegin)
+#define __NR_xend 471
+__SYSCALL(__NR_xend, sys_xend)
+#define __NR_xabort 472
+__SYSCALL(__NR_xabort, sys_xabort)
 
 #undef __NR_syscalls
-#define __NR_syscalls 470
+#define __NR_syscalls 473
 
 /*
  * 32 bit systems traditionally used different

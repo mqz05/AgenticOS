@@ -7,6 +7,7 @@
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/syscalls.h>
 #include <linux/transaction.h>
 
 // The timestamp orders transactions that contend for the same object.
@@ -240,7 +241,10 @@ struct transaction *transaction_get(struct transaction *transaction) {
 }
 EXPORT_SYMBOL_GPL(transaction_get);
 
-void transaction_put(struct transaction *transaction) {
+/* Drop a reference to a transaction and free it when the last reference
+   goes away. Leftover workset entries warn because normal commit or abort
+   handling must release them before the final reference is dropped. */
+void transaction_put(struct transaction * transaction) {
 	if (!transaction)
 		return;
 
@@ -398,7 +402,11 @@ int abort_transaction(struct transaction *transaction) {
 }
 EXPORT_SYMBOL_GPL(abort_transaction);
 
-static void terminate_transaction(struct transaction *transaction) {
+/* Complete a transaction after either commit or abort cleanup.
+   The transaction state returns to inactive, retry/abort flags are
+   reset, and any waiters blocked on conflict or sibling completion
+   are woken. */
+static void terminate_transaction(struct transaction * transaction) {
 	transaction->autoretry = 0;
 	transaction->abortWithErr = false;
 	atomic_set(&transaction->status, TRANSACTION_INACTIVE);
@@ -406,19 +414,74 @@ static void terminate_transaction(struct transaction *transaction) {
 	wake_up_all(&transaction->siblings);
 }
 
-int end_transaction(struct transaction *transaction) {
+/* Finish all objects in the transaction workset.
+   The list is first detached from the transaction under
+   the workset lock, then callbacks run without holding
+   the lock. This keeps object-specific commit or abort
+   handlers from blocking other transaction bookkeeping.
+*/
+static void transaction_finish_workset(
+	struct transaction * transaction,
+	bool commit
+) {
+	struct txobj_thread_list_node * node;
+	struct skiplist_head *first;
+	struct skiplist_head workset;
+
+	if (!transaction)
+		return;
+
+	skiplist_init_head(&workset);
+	spin_lock(&transaction->workset_lock);
+	skiplist_splice_init(&transaction->object_list, &workset);
+	spin_unlock(&transaction->workset_lock);
+
+	while ((first = skiplist_first(&workset))) {
+		node = skiplist_entry(first, struct txobj_thread_list_node,
+				      workset_list);
+		skiplist_del(&node->workset_list, &workset);
+		node->tx = NULL;
+
+		if (commit && node->commit)
+			node->commit(node);
+		else if (!commit && node->abort)
+			node->abort(node);
+		if (node->release)
+			node->release(node, 0);
+		transaction_workset_node_free(node);
+	}
+}
+
+/* Commit every object in the transaction workset and release the
+   workset entries. Object-specific commit handler publish shadow
+   state. */
+void transaction_commit_workset(struct transaction * transaction) {
+	transaction_finish_workset(transaction, true);
+}
+EXPORT_SYMBOL_GPL(transaction_commit_workset);
+
+/* Abort every object in the transacction workset and release the
+   workset entries. Object-specific abort handlers discard or roll
+   back shadow state. */
+void transaction_abort_workset(struct transaction * transaction) {
+	transaction_finish_workset(transaction, false);
+}
+EXPORT_SYMBOL_GPL(transaction_abort_workset);
+
+/* End the transaction. If the transaction is still active, this is the commit
+   path: commit all workset entries, then return the transaction to inactive
+   state. If the transaction was previously marked aborted, this is the abort
+   cleanup path: abort all workset entries, count the retry, return the
+   transaction to inactive state, adn report -ECANCELED to the caller. */
+int end_transaction(struct transaction * transaction) {
 	enum transaction_state status;
 
 	if (!transaction)
 		return -EINVAL;
 
-	status = atomic_cmpxchg(&transaction->status, TRANSACTION_ACTIVE,
-				TRANSACTION_COMMITTING);
+	status = atomic_cmpxchg(&transaction->status, TRANSACTION_ACTIVE, TRANSACTION_COMMITTING);
 	if (status == TRANSACTION_ACTIVE) {
-		if (!transaction_workset_empty(transaction)) {
-			atomic_set(&transaction->status, TRANSACTION_ACTIVE);
-			return -EBUSY;
-		}
+		transaction_commit_workset(transaction);
 		terminate_transaction(transaction);
 		return 0;
 	}
@@ -426,11 +489,8 @@ int end_transaction(struct transaction *transaction) {
 	if (status == TRANSACTION_ABORTED &&
 	    atomic_cmpxchg(&transaction->status, TRANSACTION_ABORTED,
 			   TRANSACTION_ABORTING) == TRANSACTION_ABORTED) {
-		if (!transaction_workset_empty(transaction)) {
-			atomic_set(&transaction->status, TRANSACTION_ABORTED);
-			return -EBUSY;
-		}
 		transaction->count++;
+		transaction_abort_workset(transaction);
 		terminate_transaction(transaction);
 		return -ECANCELED;
 	}
@@ -467,4 +527,106 @@ int transaction_task_fork(const struct task_struct *task) {
 		return -EOPNOTSUPP;
 
 	return 0;
+}
+
+/* Kernel-side implementation of xbegin() syscall - creates a new transaction
+   and attaches the current process/thread to it. */
+long transaction_sys_xbegin(void) {
+	struct transaction * transaction;
+	int ret;
+
+	// Check whether current task is already part of a transaction
+	if (current_transaction())
+		return -EALREADY;
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	if (!transaction)
+		return -ENOMEM;
+
+	// Attach current task to the newly created transaction
+	ret = transaction_attach_task(transaction, current);
+	if (ret) {
+		transaction_put(transaction);
+		return ret;
+	}
+
+	// Mark transaction as active and assign it a timestamp
+	ret = begin_transaction(transaction);
+	if (ret) {
+		transaction_detach_task(current);
+		transaction_put(transaction);
+		return ret;
+	}
+
+	// Drop original allocation reference
+	// task attachment keeps the transaction alive until xend(), xabort(), or task exit
+	transaction_put(transaction);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_sys_xbegin);
+
+/* Kernel-side implementation of xend() syscall - ends the current transaction
+   for this process / thread and detaches it when cleanup completes. */
+long transaction_sys_xend(void) {
+	struct transaction *transaction;
+	int ret;
+
+	// Get the transaction currently associated with this task
+	transaction = current_transaction();
+	if (!transaction)
+		return -EINVAL;
+
+	// Try to commit / end the current transaction
+	ret = end_transaction(transaction);
+	// If the transaction ended cleanly, detach the current task
+	// ret == 0 means the transaction committed successfully
+	// ret == -ECANCELED means the transaction had already been marked aborted
+	if (!ret || ret == -ECANCELED)
+		transaction_detach_task(current);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(transaction_sys_xend);
+
+/* Kernel-side implementation of xabort() syscall - explicitly aborts the current
+   transaction for this process / thread, completes cleanup, and detaches it. */
+long transaction_sys_xabort(void) {
+	struct transaction *transaction;
+	int ret;
+
+	// Get the transaction currently associated with this task
+	transaction = current_transaction();
+	if (!transaction)
+		return -EINVAL;
+
+	// Mark current transaction as aborted
+	ret = abort_transaction(transaction);
+	if (ret)
+		return ret;
+
+	// abort_transaction() only marks the transaction aborted
+	// end_transaction() performs the actual transition back to inactive and wakes up any waiting tasks
+	ret = end_transaction(transaction);
+	if (!ret || ret == -ECANCELED) {
+		transaction_detach_task(current);
+		return 0;
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(transaction_sys_xabort);
+
+// Syscall wrapper for xbegin()
+SYSCALL_DEFINE0(xbegin) {
+	return transaction_sys_xbegin();
+}
+
+// Syscall wrapper for xend()
+SYSCALL_DEFINE0(xend) {
+	return transaction_sys_xend();
+}
+
+// Syscall wrapper for xabort()
+SYSCALL_DEFINE0(xabort) {
+	return transaction_sys_xabort();
 }

@@ -198,6 +198,10 @@ static int init_file(struct file *f, int flags, const struct cred *cred)
 
 	f->f_iocb_flags = 0;
 	f->f_pos	= 0;
+	/* Initialize transaction metadata for this open file.
+	   This must happen while struct file is being initialized so later VFS
+	   hooks can safely add the file to a transaction workset. */
+	transaction_file_init(f);
 	f->f_wb_err	= 0;
 	f->f_sb_err	= 0;
 

@@ -15,6 +15,7 @@
 #endif
 
 struct task_struct;
+struct file;
 struct transaction;
 
 #ifdef CONFIG_TRANSACTIONS
@@ -148,6 +149,11 @@ struct txobj_thread_list_node *transaction_workset_find_object(struct transactio
 struct txobj_thread_list_node *transaction_workset_remove(struct transaction *transaction,
                                                           struct txobj_thread_list_node *node);
 bool transaction_workset_empty(struct transaction *transaction);
+void transaction_commit_workset(struct transaction * transaction);
+void transaction_abort_workset(struct transaction * transaction);
+
+void transaction_file_init(struct file *file);
+int transaction_file_snapshot(struct file *file);
 
 struct transaction *transaction_alloc(gfp_t gfp);
 struct transaction *transaction_get(struct transaction *transaction);
@@ -163,6 +169,9 @@ bool aborting_transaction(const struct transaction *transaction);
 int begin_transaction(struct transaction *transaction);
 int abort_transaction(struct transaction *transaction);
 int end_transaction(struct transaction *transaction);
+long transaction_sys_xbegin(void);
+long transaction_sys_xend(void);
+long transaction_sys_xabort(void);
 
 void transaction_task_init(struct task_struct *task);
 int transaction_attach_task(struct transaction *transaction, struct task_struct *task);
@@ -178,6 +187,10 @@ static inline int transaction_task_fork(const struct task_struct *task) {
 }
 static inline struct transaction *current_transaction(void) {
 	return NULL;
+}
+static inline void transaction_file_init(struct file *file) { }
+static inline int transaction_file_snapshot(struct file *file) {
+	return 0;
 }
 #endif
 

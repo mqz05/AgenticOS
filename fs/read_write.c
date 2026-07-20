@@ -61,6 +61,12 @@ static loff_t vfs_setpos_cookie(struct file *file, loff_t offset,
 		return -EINVAL;
 
 	if (offset != file->f_pos) {
+		/* lseek changes the shared file offset. 
+		Snapshot the original offset before updating it so xabort() can restore it. */
+		int ret = transaction_file_snapshot(file);
+
+		if (ret)
+			return ret;
 		file->f_pos = offset;
 		if (cookie)
 			*cookie = 0;
@@ -372,8 +378,14 @@ loff_t default_llseek(struct file *file, loff_t offset, int whence)
 	}
 	retval = -EINVAL;
 	if (offset >= 0 || unsigned_offsets(file)) {
-		if (offset != file->f_pos)
+		if (offset != file->f_pos) {
+			/* Some filesystems use default_llseek() instead of generic helper.
+			   Snapshot here as well before f_pos changes. */
+			retval = transaction_file_snapshot(file);
+			if (retval)
+				goto out;
 			file->f_pos = offset;
+		}
 		retval = offset;
 	}
 out:
@@ -712,7 +724,12 @@ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
 			pos = *ppos;
 			ppos = &pos;
 		}
-		ret = vfs_read(fd_file(f), buf, count, ppos);
+		if (ppos)
+			/* read() advances file->f_pos through the local pos copy.
+		       Snapshot before I/O so abort restores the pre-read offset. */
+			ret = transaction_file_snapshot(fd_file(f));
+		if (!ret)
+			ret = vfs_read(fd_file(f), buf, count, ppos);
 		if (ret >= 0 && ppos)
 			fd_file(f)->f_pos = pos;
 	}
@@ -735,7 +752,12 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
 			pos = *ppos;
 			ppos = &pos;
 		}
-		ret = vfs_write(fd_file(f), buf, count, ppos);
+		if (ppos)
+			/* write() advances file->f_pos through the local pos copy.
+		       Snapshot before I/O so abort restores the pre-write offset. */
+			ret = transaction_file_snapshot(fd_file(f));
+		if (!ret)
+			ret = vfs_write(fd_file(f), buf, count, ppos);
 		if (ret >= 0 && ppos)
 			fd_file(f)->f_pos = pos;
 	}
@@ -1077,7 +1099,12 @@ static ssize_t do_readv(unsigned long fd, const struct iovec __user *vec,
 			pos = *ppos;
 			ppos = &pos;
 		}
-		ret = vfs_readv(fd_file(f), vec, vlen, ppos, flags);
+		if (ppos)
+			/* readv() shares the same file-position semantics as read().
+			   Snapshot before vector I/O advances the offset. */
+			ret = transaction_file_snapshot(fd_file(f));
+		if (!ret)
+			ret = vfs_readv(fd_file(f), vec, vlen, ppos, flags);
 		if (ret >= 0 && ppos)
 			fd_file(f)->f_pos = pos;
 	}
@@ -1100,7 +1127,12 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
 			pos = *ppos;
 			ppos = &pos;
 		}
-		ret = vfs_writev(fd_file(f), vec, vlen, ppos, flags);
+		if (ppos)
+			/* writev() shares the same file-position semantics as write().
+		       Snapshot before vector I/O advances the offset. */
+			ret = transaction_file_snapshot(fd_file(f));
+		if (!ret)
+			ret = vfs_writev(fd_file(f), vec, vlen, ppos, flags);
 		if (ret >= 0 && ppos)
 			fd_file(f)->f_pos = pos;
 	}

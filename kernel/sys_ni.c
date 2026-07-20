@@ -172,6 +172,9 @@ COND_SYSCALL_COMPAT(fadvise64_64);
 COND_SYSCALL(lsm_get_self_attr);
 COND_SYSCALL(lsm_set_self_attr);
 COND_SYSCALL(lsm_list_modules);
+COND_SYSCALL(xbegin);
+COND_SYSCALL(xend);
+COND_SYSCALL(xabort);
 
 /* CONFIG_MMU only */
 COND_SYSCALL(swapon);

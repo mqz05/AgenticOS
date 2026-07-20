@@ -33,6 +33,7 @@
 #include <linux/lockdep.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/workqueue.h>
+#include <linux/transaction.h>
 #include <linux/delayed_call.h>
 #include <linux/uuid.h>
 #include <linux/errseq.h>
@@ -1231,6 +1232,11 @@ struct file {
 		u64			f_pipe;
 	};
 	loff_t				f_pos;
+#ifdef CONFIG_TRANSACTIONS
+	/* Generic transaction metadata for this open file. The VFS file adapter
+	   uses it to snapshot and restore per-open-file state such as f_pos. */
+	struct transaction_object	transaction_object;
+#endif
 #ifdef CONFIG_SECURITY
 	void				*f_security;
 #endif

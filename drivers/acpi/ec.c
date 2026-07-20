@@ -151,7 +151,7 @@ struct acpi_ec_query_handler {
 	struct kref kref;
 };
 
-struct transaction {
+struct acpi_ec_transaction {
 	const u8 *wdata;
 	u8 *rdata;
 	unsigned short irq_count;
@@ -164,7 +164,7 @@ struct transaction {
 };
 
 struct acpi_ec_query {
-	struct transaction transaction;
+	struct acpi_ec_transaction transaction;
 	struct work_struct work;
 	struct acpi_ec_query_handler *handler;
 	struct acpi_ec *ec;
@@ -646,7 +646,7 @@ static inline void ec_transaction_transition(struct acpi_ec *ec, unsigned long f
 	}
 }
 
-static void acpi_ec_spurious_interrupt(struct acpi_ec *ec, struct transaction *t)
+static void acpi_ec_spurious_interrupt(struct acpi_ec *ec, struct acpi_ec_transaction *t)
 {
 	if (t->irq_count < ec_storm_threshold)
 		++t->irq_count;
@@ -658,7 +658,7 @@ static void acpi_ec_spurious_interrupt(struct acpi_ec *ec, struct transaction *t
 
 static void advance_transaction(struct acpi_ec *ec, bool interrupt)
 {
-	struct transaction *t = ec->curr;
+	struct acpi_ec_transaction *t = ec->curr;
 	bool wakeup = false;
 	u8 status;
 
@@ -780,7 +780,7 @@ static int ec_poll(struct acpi_ec *ec)
 }
 
 static int acpi_ec_transaction_unlocked(struct acpi_ec *ec,
-					struct transaction *t)
+					struct acpi_ec_transaction *t)
 {
 	unsigned long tmp;
 	int ret = 0;
@@ -817,7 +817,7 @@ unlock:
 	return ret;
 }
 
-static int acpi_ec_transaction(struct acpi_ec *ec, struct transaction *t)
+static int acpi_ec_transaction(struct acpi_ec *ec, struct acpi_ec_transaction *t)
 {
 	int status;
 	u32 glk;
@@ -846,7 +846,7 @@ unlock:
 static int acpi_ec_burst_enable(struct acpi_ec *ec)
 {
 	u8 d;
-	struct transaction t = {.command = ACPI_EC_BURST_ENABLE,
+	struct acpi_ec_transaction t = {.command = ACPI_EC_BURST_ENABLE,
 				.wdata = NULL, .rdata = &d,
 				.wlen = 0, .rlen = 1};
 
@@ -855,7 +855,7 @@ static int acpi_ec_burst_enable(struct acpi_ec *ec)
 
 static int acpi_ec_burst_disable(struct acpi_ec *ec)
 {
-	struct transaction t = {.command = ACPI_EC_BURST_DISABLE,
+	struct acpi_ec_transaction t = {.command = ACPI_EC_BURST_DISABLE,
 				.wdata = NULL, .rdata = NULL,
 				.wlen = 0, .rlen = 0};
 
@@ -867,7 +867,7 @@ static int acpi_ec_read(struct acpi_ec *ec, u8 address, u8 *data)
 {
 	int result;
 	u8 d;
-	struct transaction t = {.command = ACPI_EC_COMMAND_READ,
+	struct acpi_ec_transaction t = {.command = ACPI_EC_COMMAND_READ,
 				.wdata = &address, .rdata = &d,
 				.wlen = 1, .rlen = 1};
 
@@ -880,7 +880,7 @@ static int acpi_ec_read_unlocked(struct acpi_ec *ec, u8 address, u8 *data)
 {
 	int result;
 	u8 d;
-	struct transaction t = {.command = ACPI_EC_COMMAND_READ,
+	struct acpi_ec_transaction t = {.command = ACPI_EC_COMMAND_READ,
 				.wdata = &address, .rdata = &d,
 				.wlen = 1, .rlen = 1};
 
@@ -892,7 +892,7 @@ static int acpi_ec_read_unlocked(struct acpi_ec *ec, u8 address, u8 *data)
 static int acpi_ec_write(struct acpi_ec *ec, u8 address, u8 data)
 {
 	u8 wdata[2] = { address, data };
-	struct transaction t = {.command = ACPI_EC_COMMAND_WRITE,
+	struct acpi_ec_transaction t = {.command = ACPI_EC_COMMAND_WRITE,
 				.wdata = wdata, .rdata = NULL,
 				.wlen = 2, .rlen = 0};
 
@@ -902,7 +902,7 @@ static int acpi_ec_write(struct acpi_ec *ec, u8 address, u8 data)
 static int acpi_ec_write_unlocked(struct acpi_ec *ec, u8 address, u8 data)
 {
 	u8 wdata[2] = { address, data };
-	struct transaction t = {.command = ACPI_EC_COMMAND_WRITE,
+	struct acpi_ec_transaction t = {.command = ACPI_EC_COMMAND_WRITE,
 				.wdata = wdata, .rdata = NULL,
 				.wlen = 2, .rlen = 0};
 
@@ -940,7 +940,7 @@ int ec_transaction(u8 command,
 		   const u8 *wdata, unsigned wdata_len,
 		   u8 *rdata, unsigned rdata_len)
 {
-	struct transaction t = {.command = command,
+	struct acpi_ec_transaction t = {.command = command,
 				.wdata = wdata, .rdata = rdata,
 				.wlen = wdata_len, .rlen = rdata_len};
 
@@ -1174,7 +1174,7 @@ static void acpi_ec_event_processor(struct work_struct *work)
 static struct acpi_ec_query *acpi_ec_create_query(struct acpi_ec *ec, u8 *pval)
 {
 	struct acpi_ec_query *q;
-	struct transaction *t;
+	struct acpi_ec_transaction *t;
 
 	q = kzalloc(sizeof (struct acpi_ec_query), GFP_KERNEL);
 	if (!q)

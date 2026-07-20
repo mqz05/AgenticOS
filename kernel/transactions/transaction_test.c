@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <kunit/test.h>
+#include <linux/anon_inodes.h>
 #include <linux/completion.h>
 #include <linux/errno.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/transaction.h>
@@ -14,6 +17,16 @@ struct transaction_race_context {
 	int abort_ret;
 };
 
+/* Shared test state used by workset callbacks to verify that commit,
+   abort, and release handlers are called on the expected path. */
+struct transaction_workset_test_context {
+	int commit_count;
+	int abort_count;
+	int release_count;
+};
+
+static const struct file_operations transaction_test_file_operations = { };
+
 static atomic_t transaction_callback_calls = ATOMIC_INIT(0);
 
 static int transaction_test_callback(struct txobj_thread_list_node *node) {
@@ -23,6 +36,27 @@ static int transaction_test_callback(struct txobj_thread_list_node *node) {
 
 static int transaction_test_lock_callback(struct txobj_thread_list_node *node, int blocking) {
 	atomic_inc(&transaction_callback_calls);
+	return 0;
+}
+
+/* Workset callback used by tests to record that an object reached the commit path. */
+static int transaction_workset_commit(struct txobj_thread_list_node * node) {
+	struct transaction_workset_test_context * context = node->shadow_obj;
+	context->commit_count++;
+	return 0;
+}
+
+/* Workset callback used by tests to record that an object reached the abort path. */
+static int transaction_workset_abort(struct txobj_thread_list_node * node) {
+	struct transaction_workset_test_context *context = node->shadow_obj;
+	context->abort_count++;
+	return 0;
+}
+
+/* Workset callback used by tests to record that object-private state was released after commit or abort handling. */
+static int transaction_workset_release(struct txobj_thread_list_node * node, int early) {
+	struct transaction_workset_test_context *context = node->shadow_obj;
+	context->release_count++;
 	return 0;
 }
 
@@ -303,8 +337,11 @@ static void transaction_workset_ordering_test(struct kunit *test) {
 	transaction_put(transaction);
 }
 
-static void transaction_nonempty_workset_end_test(struct kunit *test) {
+/* Committing a transaction should call each entry's commit callback,
+   release the entry's private state, and leave the workset empty. */
+static void transaction_workset_commit_cleanup_test(struct kunit *test) {
 	struct txobj_thread_list_node *node;
+	struct transaction_workset_test_context context = { };
 	struct transaction_object object;
 	struct transaction *transaction;
 	unsigned long original;
@@ -314,23 +351,28 @@ static void transaction_nonempty_workset_end_test(struct kunit *test) {
 	KUNIT_ASSERT_NOT_NULL(test, transaction);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	node = transaction_workset_node_alloc(
-		NULL, &original, &object, TRANSACTION_OBJECT_CUSTOM,
-		TRANSACTION_ACCESS_READ, GFP_KERNEL);
+		&context, &original, &object, TRANSACTION_OBJECT_CUSTOM,
+		TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, node);
+	node->commit = transaction_workset_commit;
+	node->abort = transaction_workset_abort;
+	node->release = transaction_workset_release;
 	KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, node), 0);
 
-	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -EBUSY);
-	KUNIT_EXPECT_EQ(test, transaction_status(transaction), TRANSACTION_ACTIVE);
-	KUNIT_EXPECT_PTR_EQ(test,
-		transaction_workset_remove(transaction, node), node);
-	transaction_workset_node_free(node);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
 	KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
+	KUNIT_EXPECT_TRUE(test, transaction_workset_empty(transaction));
+	KUNIT_EXPECT_EQ(test, context.commit_count, 1);
+	KUNIT_EXPECT_EQ(test, context.abort_count, 0);
+	KUNIT_EXPECT_EQ(test, context.release_count, 1);
 	transaction_put(transaction);
 }
 
-static void transaction_aborted_nonempty_workset_end_test(struct kunit *test) {
+/* Aborting a transaction should call each entry's abort callback, release
+   the entry's private state, and leave the workset empty. */
+static void transaction_workset_abort_cleanup_test(struct kunit *test) {
 	struct txobj_thread_list_node *node;
+	struct transaction_workset_test_context context = { };
 	struct transaction_object object;
 	struct transaction *transaction;
 	unsigned long original;
@@ -340,21 +382,89 @@ static void transaction_aborted_nonempty_workset_end_test(struct kunit *test) {
 	KUNIT_ASSERT_NOT_NULL(test, transaction);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	node = transaction_workset_node_alloc(
-		NULL, &original, &object, TRANSACTION_OBJECT_CUSTOM,
-		TRANSACTION_ACCESS_READ, GFP_KERNEL);
+		&context, &original, &object, TRANSACTION_OBJECT_CUSTOM,
+		TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, node);
+	node->commit = transaction_workset_commit;
+	node->abort = transaction_workset_abort;
+	node->release = transaction_workset_release;
 	KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, node), 0);
 	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
 
-	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -EBUSY);
-	KUNIT_EXPECT_EQ(test, transaction_status(transaction),
-			TRANSACTION_ABORTED);
-	KUNIT_EXPECT_PTR_EQ(test,
-		transaction_workset_remove(transaction, node), node);
-	transaction_workset_node_free(node);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
 	KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
+	KUNIT_EXPECT_TRUE(test, transaction_workset_empty(transaction));
+	KUNIT_EXPECT_EQ(test, context.commit_count, 0);
+	KUNIT_EXPECT_EQ(test, context.abort_count, 1);
+	KUNIT_EXPECT_EQ(test, context.release_count, 1);
 	transaction_put(transaction);
+}
+
+/* Aborting a transaction restores the file offset captured at the first
+   transactional touch. */
+static void transaction_file_offset_abort_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	file->f_pos = 17;
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
+	file->f_pos = 29;
+	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
+	file->f_pos = 41;
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, file->f_pos, 17);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
+/* Committing a transaction keeps the in-place file offset update and only
+   releases the saved shadow state. */
+static void transaction_file_offset_commit_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	file->f_pos = 17;
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
+	file->f_pos = 41;
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, file->f_pos, 41);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_syscall_commit_test(struct kunit *test) {
+	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
+	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
+	KUNIT_EXPECT_TRUE(test, live_transaction(current_transaction()));
+	KUNIT_EXPECT_EQ(test, transaction_sys_xbegin(), (long)-EALREADY);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xend(), 0L);
+	KUNIT_EXPECT_PTR_EQ(test, current_transaction(), NULL);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xend(), (long)-EINVAL);
+}
+
+static void transaction_syscall_abort_test(struct kunit *test) {
+	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
+	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xabort(), 0L);
+	KUNIT_EXPECT_PTR_EQ(test, current_transaction(), NULL);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xabort(), (long)-EINVAL);
 }
 
 static void transaction_live_fork_test(struct kunit *test) {
@@ -414,8 +524,12 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_workset_lifecycle_test),
 	KUNIT_CASE(transaction_workset_duplicate_test),
 	KUNIT_CASE(transaction_workset_ordering_test),
-	KUNIT_CASE(transaction_nonempty_workset_end_test),
-	KUNIT_CASE(transaction_aborted_nonempty_workset_end_test),
+	KUNIT_CASE(transaction_workset_commit_cleanup_test),
+	KUNIT_CASE(transaction_workset_abort_cleanup_test),
+	KUNIT_CASE(transaction_file_offset_abort_test),
+	KUNIT_CASE(transaction_file_offset_commit_test),
+	KUNIT_CASE(transaction_syscall_commit_test),
+	KUNIT_CASE(transaction_syscall_abort_test),
 	KUNIT_CASE(transaction_live_fork_test),
 	KUNIT_CASE(transaction_commit_abort_race_test),
 	{}

@@ -204,7 +204,7 @@ struct acpi_ec {
 	struct mutex mutex;
 	wait_queue_head_t wait;
 	struct list_head list;
-	struct transaction *curr;
+	struct acpi_ec_transaction *curr;
 	spinlock_t lock;
 	struct work_struct work;
 	unsigned long timestamp;
