@@ -6,6 +6,7 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/sched.h>
+#include <linux/sched/prio.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/transaction.h>
@@ -120,7 +121,8 @@ int transaction_workset_add(struct transaction *transaction, struct txobj_thread
 		return -EBUSY;
 
 	spin_lock(&transaction->workset_lock);
-	if (transaction_status(transaction) != TRANSACTION_ACTIVE) {
+	if (transaction_status(transaction) != TRANSACTION_ACTIVE ||
+	    atomic_read_acquire(&transaction->finishing)) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -222,6 +224,7 @@ struct transaction *transaction_alloc(gfp_t gfp) {
 	atomic_set(&transaction->task_count, 0);
 	refcount_set(&transaction->ref_count, 1);
 	atomic_set(&transaction->status, TRANSACTION_INACTIVE);
+	atomic_set(&transaction->finishing, 0);
 	transaction->unsupported_operation_action = UNSUPPORTED_ABORT;
 	skiplist_init_head(&transaction->object_list);
 	spin_lock_init(&transaction->workset_lock);
@@ -353,6 +356,75 @@ bool aborting_transaction(const struct transaction *transaction) {
 }
 EXPORT_SYMBOL_GPL(aborting_transaction);
 
+// Return the best dynamic priority among the tasks in a transaction.
+static int transaction_best_priority(struct transaction *transaction) {
+	struct task_struct *task;
+	int priority = MAX_PRIO;
+
+	spin_lock(&transaction->lock);
+	list_for_each_entry(task, &transaction->tasks, transaction_entry) {
+		if (task->prio < priority)
+			priority = task->prio;
+	}
+	spin_unlock(&transaction->lock);
+
+	return priority;
+}
+
+/*
+ * Contention manager function. Return true if a wins the conflict over b.
+ * should_sleep indicates that two active transactions were arbitrated by
+ * priority and timestamp, rather than by an abort or commit state. It does not
+	 * sleep here, in a future acquisition the retry path may use it to wait for
+ * the winner to finish before retrying.
+ */
+bool transaction_contention_manager(struct transaction *a, struct transaction *b, bool *should_sleep) {
+	enum transaction_state status_a;
+	enum transaction_state status_b;
+	int priority_a;
+	int priority_b;
+	bool priority_winner;
+
+	status_a = transaction_status(a);
+	status_b = transaction_status(b);
+	priority_a = transaction_best_priority(a);
+	priority_b = transaction_best_priority(b);
+
+	// Lower value means higher prio
+	if (priority_a < priority_b)
+		priority_winner = true;
+	else if (priority_a > priority_b)
+		priority_winner = false;
+	else
+		priority_winner = READ_ONCE(a->timestamp) < READ_ONCE(b->timestamp);
+
+	if (should_sleep)
+		*should_sleep = false;
+
+	// Aborted transactions have to lose.
+	if (status_a == TRANSACTION_ABORTED || status_a == TRANSACTION_ABORTING)
+		return false;
+	if (status_b == TRANSACTION_ABORTED || status_b == TRANSACTION_ABORTING)
+		return true;
+
+	// Committing transactions have to win.
+	if (status_a == TRANSACTION_COMMITTING)
+		return true;
+	if (status_b == TRANSACTION_COMMITTING)
+		return false;
+
+	/*
+	 * If both are active transactions, arbitrate based on dynamic priority
+	 * first and use the timestamp to break ties.
+	 */
+	if (should_sleep && status_a == TRANSACTION_ACTIVE &&
+	    status_b == TRANSACTION_ACTIVE)
+		*should_sleep = true;
+
+	return priority_winner;
+}
+EXPORT_SYMBOL_GPL(transaction_contention_manager);
+
 int begin_transaction(struct transaction *transaction) {
 	int ret = 0;
 
@@ -360,7 +432,7 @@ int begin_transaction(struct transaction *transaction) {
 		return -EINVAL;
 
 	spin_lock(&transaction->lock);
-	if (!inactive_transaction(transaction)) {
+	if (!inactive_transaction(transaction) || atomic_read(&transaction->finishing)) {
 		ret = -EALREADY;
 		goto out;
 	}
@@ -381,24 +453,33 @@ EXPORT_SYMBOL_GPL(begin_transaction);
  */
 int abort_transaction(struct transaction *transaction) {
 	enum transaction_state status;
+	int ret;
 
 	if (!transaction)
 		return -EINVAL;
 
+	spin_lock(&transaction->lock);
 	status = atomic_cmpxchg(&transaction->status, TRANSACTION_ACTIVE,
 				TRANSACTION_ABORTED);
 	switch (status) {
 	case TRANSACTION_ACTIVE:
 	case TRANSACTION_ABORTED:
 	case TRANSACTION_ABORTING:
-		return 0;
+		ret = 0;
+		break;
 	case TRANSACTION_INACTIVE:
-		return -EINVAL;
+		ret = -EINVAL;
+		break;
 	case TRANSACTION_COMMITTING:
-		return -EBUSY;
+		ret = -EBUSY;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
 	}
+	spin_unlock(&transaction->lock);
 
-	return -EINVAL;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(abort_transaction);
 
@@ -407,98 +488,170 @@ EXPORT_SYMBOL_GPL(abort_transaction);
    reset, and any waiters blocked on conflict or sibling completion
    are woken. */
 static void terminate_transaction(struct transaction * transaction) {
+	spin_lock(&transaction->lock);
 	transaction->autoretry = 0;
 	transaction->abortWithErr = false;
 	atomic_set(&transaction->status, TRANSACTION_INACTIVE);
+	atomic_set_release(&transaction->finishing, 0);
+	spin_unlock(&transaction->lock);
 	wake_up_all(&transaction->losers);
 	wake_up_all(&transaction->siblings);
 }
 
-/* Finish all objects in the transaction workset.
-   The list is first detached from the transaction under
-   the workset lock, then callbacks run without holding
-   the lock. This keeps object-specific commit or abort
-   handlers from blocking other transaction bookkeeping.
-*/
-static void transaction_finish_workset(
-	struct transaction * transaction,
-	bool commit
-) {
-	struct txobj_thread_list_node * node;
+/*
+ * Finish all objects in kernel address order. Blocking object locks are
+ * acquired first, followed by non-blocking locks and transaction-object
+ * locks. Ownership and callbacks remain protected until every object has
+ * committed or aborted.
+ */
+static int transaction_finish_workset(struct transaction *transaction) {
+	struct txobj_thread_list_node *first_node;
+	struct txobj_thread_list_node *node;
 	struct skiplist_head *first;
 	struct skiplist_head workset;
+	enum transaction_state status;
+	bool commit = false;
+	int validation_ret = 0;
+	int ret;
 
 	if (!transaction)
-		return;
+		return -EINVAL;
 
 	skiplist_init_head(&workset);
+	// TODO: add transactional lists (list_list) too when implemented
 	spin_lock(&transaction->workset_lock);
 	skiplist_splice_init(&transaction->object_list, &workset);
 	spin_unlock(&transaction->workset_lock);
 
+	// Acquire blocking locks in original-object address order.
+	skiplist_for_each_entry(node, &workset, workset_list) {
+		if (node->lock)
+			WARN_ON_ONCE(node->lock(node, 1));
+	}
+
+	// Acquire non-blocking locks, then every transaction-object lock.
+	first_node = skiplist_entry_safe(skiplist_first(&workset), struct txobj_thread_list_node, workset_list);
+	skiplist_for_each_entry(node, &workset, workset_list) {
+		if (node->lock)
+			WARN_ON_ONCE(node->lock(node, 0));
+		if (node == first_node)
+			spin_lock(&node->tx_obj->lock);
+		else
+			spin_lock_nest_lock(&node->tx_obj->lock, &first_node->tx_obj->lock);
+	}
+
+	/*
+	 * TODO: Optional validation that runs if CONFIG_TX_KSTM_ASSERTIONS was set in TxOS
+	 * transactional objects should expose a validate() function to support this feature
+	 */
+	// if (transaction_status(transaction) == TRANSACTION_ACTIVE) {
+	// 	skiplist_for_each_entry(node, &workset, workset_list) {
+	// 		if (!node->validate)
+	// 			continue;
+	// 		callback_ret = node->validate(node);
+	// 		if (callback_ret && !validation_ret)
+	// 			validation_ret = callback_ret < 0 ? callback_ret : -EINVAL;
+	// 	}
+	// }
+
+	/*
+	 * All object locks are held, so choose the final outcome here. An abort that is
+	 * already recorded wins, but after COMMITTING is set, abort can no longer win.
+	 */
+	spin_lock(&transaction->lock);
+	status = transaction_status(transaction);
+
+	if (status == TRANSACTION_ACTIVE && !validation_ret) {
+		// Try to commit the active transaction.
+		status = atomic_cmpxchg(&transaction->status, TRANSACTION_ACTIVE, TRANSACTION_COMMITTING);
+		if (WARN_ON_ONCE(status != TRANSACTION_ACTIVE)) {
+			atomic_set(&transaction->status, TRANSACTION_ABORTING);
+			transaction->count++;
+			ret = -ECANCELED;
+		} else {
+			commit = true;
+			ret = 0;
+		}
+	} else if (status == TRANSACTION_ACTIVE || status == TRANSACTION_ABORTED) {
+		// Abort after validation failure or an earlier abort.
+		atomic_set(&transaction->status, TRANSACTION_ABORTING);
+		transaction->count++;
+		ret = validation_ret ? validation_ret : -ECANCELED;
+	} else {
+		// Handle an unexpected transaction state.
+		WARN_ON_ONCE(1);
+		atomic_set(&transaction->status, TRANSACTION_ABORTING);
+		transaction->count++;
+		ret = -EBUSY;
+	}
+	spin_unlock(&transaction->lock);
+
+	// Remove ownership before publishing or rolling back object state.
+	skiplist_for_each_entry(node, &workset, workset_list) {
+		transaction_object_remove_ownership_locked(node);
+		if (commit && node->commit)
+			WARN_ON_ONCE(node->commit(node));
+		else if (!commit && node->abort)
+			WARN_ON_ONCE(node->abort(node));
+	}
+
+	// Release transaction-object and non-blocking locks in reverse order.
+	skiplist_for_each_entry_reverse(node, &workset, workset_list) {
+		spin_unlock(&node->tx_obj->lock);
+		if (node->unlock)
+			WARN_ON_ONCE(node->unlock(node, 0));
+	}
+
+	// Release blocking locks in reverse order.
+	skiplist_for_each_entry_reverse(node, &workset, workset_list) {
+		if (node->unlock)
+			WARN_ON_ONCE(node->unlock(node, 1));
+	}
+
 	while ((first = skiplist_first(&workset))) {
-		node = skiplist_entry(first, struct txobj_thread_list_node,
-				      workset_list);
+		node = skiplist_entry(first, struct txobj_thread_list_node, workset_list);
 		skiplist_del(&node->workset_list, &workset);
 		node->tx = NULL;
 
-		if (commit && node->commit)
-			node->commit(node);
-		else if (!commit && node->abort)
-			node->abort(node);
 		if (node->release)
-			node->release(node, 0);
+			WARN_ON_ONCE(node->release(node, 0));
 		transaction_workset_node_free(node);
 	}
+
+	return ret;
 }
 
-/* Commit every object in the transaction workset and release the
-   workset entries. Object-specific commit handler publish shadow
-   state. */
-void transaction_commit_workset(struct transaction * transaction) {
-	transaction_finish_workset(transaction, true);
-}
-EXPORT_SYMBOL_GPL(transaction_commit_workset);
-
-/* Abort every object in the transacction workset and release the
-   workset entries. Object-specific abort handlers discard or roll
-   back shadow state. */
-void transaction_abort_workset(struct transaction * transaction) {
-	transaction_finish_workset(transaction, false);
-}
-EXPORT_SYMBOL_GPL(transaction_abort_workset);
-
-/* End the transaction. If the transaction is still active, this is the commit
-   path: commit all workset entries, then return the transaction to inactive
-   state. If the transaction was previously marked aborted, this is the abort
-   cleanup path: abort all workset entries, count the retry, return the
-   transaction to inactive state, adn report -ECANCELED to the caller. */
+/*
+ * Claim completion without making the transaction unabortable. The final
+ * COMMITTING transition happens only after transaction_finish_workset() has
+ * acquired every ordered object lock.
+ */
 int end_transaction(struct transaction * transaction) {
 	enum transaction_state status;
+	int ret;
 
 	if (!transaction)
 		return -EINVAL;
 
-	status = atomic_cmpxchg(&transaction->status, TRANSACTION_ACTIVE, TRANSACTION_COMMITTING);
-	if (status == TRANSACTION_ACTIVE) {
-		transaction_commit_workset(transaction);
-		terminate_transaction(transaction);
-		return 0;
+	spin_lock(&transaction->lock);
+	status = transaction_status(transaction);
+	if (atomic_read(&transaction->finishing))
+		ret = -EBUSY;
+	else if (status == TRANSACTION_INACTIVE)
+		ret = -EINVAL;
+	else if (status == TRANSACTION_ACTIVE || status == TRANSACTION_ABORTED) {
+		atomic_set_release(&transaction->finishing, 1);
+		ret = 0;
+	} else {
+		ret = -EBUSY;
 	}
+	spin_unlock(&transaction->lock);
+	if (ret)
+		return ret;
 
-	if (status == TRANSACTION_ABORTED &&
-	    atomic_cmpxchg(&transaction->status, TRANSACTION_ABORTED,
-			   TRANSACTION_ABORTING) == TRANSACTION_ABORTED) {
-		transaction->count++;
-		transaction_abort_workset(transaction);
-		terminate_transaction(transaction);
-		return -ECANCELED;
-	}
-
-	if (status == TRANSACTION_INACTIVE)
-		return -EINVAL;
-
-	return -EBUSY;
+	ret = transaction_finish_workset(transaction);
+	terminate_transaction(transaction);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(end_transaction);
 

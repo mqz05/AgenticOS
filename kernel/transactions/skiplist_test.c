@@ -70,8 +70,9 @@ static void skiplist_single_node_test(struct kunit *test) {
 	KUNIT_EXPECT_FALSE(test, skiplist_empty(&head));
 	KUNIT_EXPECT_TRUE(test, skiplist_linked(&node.list));
 	KUNIT_EXPECT_PTR_EQ(test, skiplist_first(&head), &node.list);
-	KUNIT_EXPECT_PTR_EQ(test,
-		skiplist_next(&head, &node.list), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, skiplist_last(&head), &node.list);
+	KUNIT_EXPECT_PTR_EQ(test, skiplist_next(&head, &node.list), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, skiplist_prev(&head, &node.list), NULL);
 	KUNIT_EXPECT_EQ(test, skiplist_validate(&head), 0);
 
 	skiplist_del(&node.list, &head);
@@ -109,6 +110,14 @@ static void skiplist_expect_order(struct kunit *test,
 		index++;
 	}
 	KUNIT_EXPECT_EQ(test, index, count);
+
+	index = count;
+	skiplist_for_each_entry_reverse(node, &head, list) {
+		KUNIT_ASSERT_GT(test, index, (size_t)0);
+		index--;
+		KUNIT_EXPECT_EQ(test, node->address, expected[index]);
+	}
+	KUNIT_EXPECT_EQ(test, index, 0);
 	KUNIT_EXPECT_EQ(test, skiplist_validate(&head), 0);
 
 	for (i = 0; i < count; i++)

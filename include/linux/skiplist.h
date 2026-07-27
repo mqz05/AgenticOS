@@ -42,6 +42,20 @@ static inline struct skiplist_head *skiplist_next(const struct skiplist_head *he
 	return node->next[0];
 }
 
+static inline struct skiplist_head *skiplist_last(const struct skiplist_head *head) {
+	if (skiplist_empty(head))
+		return NULL;
+
+	return head->prev[0];
+}
+
+static inline struct skiplist_head *skiplist_prev(const struct skiplist_head *head, const struct skiplist_head *node) {
+	if (node->prev[0] == head)
+		return NULL;
+
+	return node->prev[0];
+}
+
 #define skiplist_entry(ptr, type, member) \
 	container_of(ptr, type, member)
 
@@ -59,5 +73,10 @@ static inline struct skiplist_head *skiplist_next(const struct skiplist_head *he
 	     pos = skiplist_entry_safe(                          \
 		     skiplist_next(head, &pos->member),            \
 		     typeof(*pos), member))
+
+#define skiplist_for_each_entry_reverse(pos, head, member)	\
+	for (pos = skiplist_entry_safe(skiplist_last(head), typeof(*pos), member); \
+	     pos; \
+	     pos = skiplist_entry_safe(skiplist_prev(head, &pos->member), typeof(*pos), member))
 
 #endif /* _LINUX_SKIPLIST_H */

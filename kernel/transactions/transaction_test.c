@@ -17,12 +17,57 @@ struct transaction_race_context {
 	int abort_ret;
 };
 
+struct transaction_finish_race_context {
+	struct transaction *transaction;
+	struct completion blocking_lock;
+	struct completion resume;
+	struct completion done;
+	int commit_count;
+	int abort_count;
+	int end_ret;
+};
+
 /* Shared test state used by workset callbacks to verify that commit,
    abort, and release handlers are called on the expected path. */
 struct transaction_workset_test_context {
 	int commit_count;
 	int abort_count;
 	int release_count;
+};
+
+struct transaction_contention_test_context {
+	struct transaction *transaction;
+	struct task_struct *task;
+};
+
+enum transaction_finish_test_event {
+	TRANSACTION_FINISH_BLOCKING_LOCK = 1,
+	TRANSACTION_FINISH_NONBLOCKING_LOCK,
+	TRANSACTION_FINISH_VALIDATE,
+	TRANSACTION_FINISH_COMMIT,
+	TRANSACTION_FINISH_NONBLOCKING_UNLOCK,
+	TRANSACTION_FINISH_BLOCKING_UNLOCK,
+	TRANSACTION_FINISH_RELEASE,
+};
+
+struct transaction_finish_test_log {
+	int events[16];
+	unsigned int count;
+};
+
+struct transaction_finish_test_context {
+	struct transaction_finish_test_log *log;
+	struct transaction_object *object;
+	struct transaction *transaction;
+	int id;
+	int blocking_locks;
+	int nonblocking_locks;
+	bool validate_locked;
+	bool validate_owned;
+	bool commit_locked;
+	bool commit_unowned;
+	bool release_unlocked;
+	bool release_detached;
 };
 
 static const struct file_operations transaction_test_file_operations = { };
@@ -36,6 +81,101 @@ static int transaction_test_callback(struct txobj_thread_list_node *node) {
 
 static int transaction_test_lock_callback(struct txobj_thread_list_node *node, int blocking) {
 	atomic_inc(&transaction_callback_calls);
+	return 0;
+}
+
+static int transaction_finish_race_lock(struct txobj_thread_list_node *node, int blocking) {
+	struct transaction_finish_race_context *context = node->shadow_obj;
+
+	if (blocking) {
+		complete(&context->blocking_lock);
+		wait_for_completion(&context->resume);
+	}
+	return 0;
+}
+
+static int transaction_finish_race_commit(struct txobj_thread_list_node *node) {
+	struct transaction_finish_race_context *context = node->shadow_obj;
+
+	context->commit_count++;
+	return 0;
+}
+
+static int transaction_finish_race_abort(struct txobj_thread_list_node *node) {
+	struct transaction_finish_race_context *context = node->shadow_obj;
+
+	context->abort_count++;
+	return 0;
+}
+
+static int transaction_finish_thread(void *data) {
+	struct transaction_finish_race_context *context = data;
+
+	context->end_ret = end_transaction(context->transaction);
+	complete(&context->done);
+	return 0;
+}
+
+static int transaction_validation_fail(struct txobj_thread_list_node *node) {
+	return -ESTALE;
+}
+
+static void transaction_finish_test_record(struct transaction_finish_test_context *context, int event) {
+	context->log->events[context->log->count++] = context->id * 10 + event;
+}
+
+static int transaction_finish_test_lock(struct txobj_thread_list_node *node, int blocking) {
+	struct transaction_finish_test_context *context = node->shadow_obj;
+
+	if (blocking) {
+		context->blocking_locks++;
+		transaction_finish_test_record(context, TRANSACTION_FINISH_BLOCKING_LOCK);
+	} else {
+		context->nonblocking_locks++;
+		transaction_finish_test_record(context, TRANSACTION_FINISH_NONBLOCKING_LOCK);
+	}
+
+	return 0;
+}
+
+static int transaction_finish_test_unlock(struct txobj_thread_list_node *node, int blocking) {
+	struct transaction_finish_test_context *context = node->shadow_obj;
+
+	if (blocking) {
+		context->blocking_locks--;
+		transaction_finish_test_record(context, TRANSACTION_FINISH_BLOCKING_UNLOCK);
+	} else {
+		context->nonblocking_locks--;
+		transaction_finish_test_record(context, TRANSACTION_FINISH_NONBLOCKING_UNLOCK);
+	}
+
+	return 0;
+}
+
+static int transaction_finish_test_validate(struct txobj_thread_list_node *node) {
+	struct transaction_finish_test_context *context = node->shadow_obj;
+
+	context->validate_locked = spin_is_locked(&context->object->lock);
+	context->validate_owned = context->object->writer == context->transaction && !list_empty(&node->object_list);
+	transaction_finish_test_record(context, TRANSACTION_FINISH_VALIDATE);
+	return 0;
+}
+
+static int transaction_finish_test_commit(struct txobj_thread_list_node *node) {
+	struct transaction_finish_test_context *context = node->shadow_obj;
+
+	context->commit_locked = spin_is_locked(&context->object->lock);
+	context->commit_unowned = context->object->writer == NULL && list_empty(&node->object_list);
+	transaction_finish_test_record(context, TRANSACTION_FINISH_COMMIT);
+	return 0;
+}
+
+static int transaction_finish_test_release(struct txobj_thread_list_node *node, int early) {
+	struct transaction_finish_test_context *context = node->shadow_obj;
+
+	context->release_unlocked = !context->blocking_locks && !context->nonblocking_locks;
+	context->release_detached = node->tx == NULL;
+	transaction_finish_test_record(context, TRANSACTION_FINISH_RELEASE);
 	return 0;
 }
 
@@ -70,6 +210,545 @@ static int transaction_abort_thread(void *data) {
 	return 0;
 }
 
+static int transaction_contention_test_init(struct kunit *test,
+					    struct transaction_contention_test_context *context,
+					    int priority) {
+	int ret;
+
+	context->transaction = transaction_alloc(GFP_KERNEL);
+	if (!context->transaction)
+		return -ENOMEM;
+
+	context->task = kunit_kzalloc(test, sizeof(*context->task), GFP_KERNEL);
+	if (!context->task) {
+		transaction_put(context->transaction);
+		context->transaction = NULL;
+		return -ENOMEM;
+	}
+
+	transaction_task_init(context->task);
+	context->task->prio = priority;
+	ret = transaction_attach_task(context->transaction, context->task);
+	if (ret)
+		goto put_transaction;
+
+	ret = begin_transaction(context->transaction);
+	if (ret)
+		goto detach_task;
+
+	return 0;
+
+detach_task:
+	transaction_detach_task(context->task);
+put_transaction:
+	transaction_put(context->transaction);
+	context->transaction = NULL;
+	return ret;
+}
+
+static void transaction_contention_cleanup(struct transaction_contention_test_context *context) {
+	if (!context->transaction)
+		return;
+
+	if (!inactive_transaction(context->transaction)) {
+		atomic_set(&context->transaction->status, TRANSACTION_ACTIVE);
+		end_transaction(context->transaction);
+	}
+	transaction_detach_task(context->task);
+	transaction_put(context->transaction);
+}
+
+static int transaction_object_test_acquire(struct transaction_contention_test_context *context, struct transaction_object *object,
+					   void *orig_obj, enum transaction_access_mode mode, bool *should_sleep,
+					   struct txobj_thread_list_node **node_out) {
+	struct txobj_thread_list_node *node;
+	int ret;
+
+	node = transaction_workset_node_alloc(NULL, orig_obj, object, object->type, mode, GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+
+	ret = transaction_workset_add(context->transaction, node);
+	if (ret) {
+		transaction_workset_node_free(node);
+		return ret;
+	}
+
+	*node_out = node;
+	return transaction_object_acquire(context->transaction, node, mode, should_sleep);
+}
+
+static void transaction_object_test_cleanup(struct transaction_contention_test_context *context, struct txobj_thread_list_node *node) {
+	if (node) {
+		transaction_object_remove_ownership(node);
+		transaction_workset_remove(context->transaction, node);
+		transaction_workset_node_free(node);
+	}
+	transaction_contention_cleanup(context);
+}
+
+static int transaction_contention_test_init_pair(struct kunit *test,
+						 struct transaction_contention_test_context *a,
+						 int priority_a,
+						 struct transaction_contention_test_context *b,
+						 int priority_b) {
+	int ret;
+
+	ret = transaction_contention_test_init(test, a, priority_a);
+	if (ret)
+		return ret;
+
+	ret = transaction_contention_test_init(test, b, priority_b);
+	if (ret)
+		transaction_contention_cleanup(a);
+
+	return ret;
+}
+
+static void transaction_contention_priority_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	bool should_sleep = false;
+
+	KUNIT_ASSERT_EQ(test,
+		transaction_contention_test_init_pair(test, &a, 100, &b, 120),
+		0);
+	a.transaction->timestamp = 20;
+	b.transaction->timestamp = 10;
+
+	KUNIT_EXPECT_TRUE(test,
+		transaction_contention_manager(a.transaction, b.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+	should_sleep = false;
+	KUNIT_EXPECT_FALSE(test,
+		transaction_contention_manager(b.transaction, a.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+
+	transaction_contention_cleanup(&b);
+	transaction_contention_cleanup(&a);
+}
+
+static void transaction_contention_timestamp_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	bool should_sleep = false;
+
+	KUNIT_ASSERT_EQ(test,
+		transaction_contention_test_init_pair(test, &a, 120, &b, 120),
+		0);
+	KUNIT_ASSERT_LT(test, a.transaction->timestamp,
+			b.transaction->timestamp);
+
+	KUNIT_EXPECT_TRUE(test,
+		transaction_contention_manager(a.transaction, b.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+	should_sleep = false;
+	KUNIT_EXPECT_FALSE(test,
+		transaction_contention_manager(b.transaction, a.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+
+	atomic_set(&b.transaction->status, TRANSACTION_INACTIVE);
+	should_sleep = true;
+	KUNIT_EXPECT_TRUE(test,
+		transaction_contention_manager(a.transaction, b.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_FALSE(test, should_sleep);
+
+	transaction_contention_cleanup(&b);
+	transaction_contention_cleanup(&a);
+}
+
+static void transaction_contention_aborted_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	bool should_sleep = true;
+
+	KUNIT_ASSERT_EQ(test,
+		transaction_contention_test_init_pair(test, &a, 100, &b, 120),
+		0);
+	atomic_set(&a.transaction->status, TRANSACTION_ABORTED);
+
+	KUNIT_EXPECT_FALSE(test,
+		transaction_contention_manager(a.transaction, b.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_FALSE(test, should_sleep);
+	should_sleep = true;
+	KUNIT_EXPECT_TRUE(test,
+		transaction_contention_manager(b.transaction, a.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_FALSE(test, should_sleep);
+
+	atomic_set(&a.transaction->status, TRANSACTION_ABORTING);
+	should_sleep = true;
+	KUNIT_EXPECT_FALSE(test,
+		transaction_contention_manager(a.transaction, b.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_FALSE(test, should_sleep);
+
+	transaction_contention_cleanup(&b);
+	transaction_contention_cleanup(&a);
+}
+
+static void transaction_contention_committing_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	bool should_sleep = true;
+
+	KUNIT_ASSERT_EQ(test,
+		transaction_contention_test_init_pair(test, &a, 120, &b, 100),
+		0);
+	atomic_set(&a.transaction->status, TRANSACTION_COMMITTING);
+
+	KUNIT_EXPECT_TRUE(test,
+		transaction_contention_manager(a.transaction, b.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_FALSE(test, should_sleep);
+	should_sleep = true;
+	KUNIT_EXPECT_FALSE(test,
+		transaction_contention_manager(b.transaction, a.transaction,
+					       &should_sleep));
+	KUNIT_EXPECT_FALSE(test, should_sleep);
+
+	transaction_contention_cleanup(&b);
+	transaction_contention_cleanup(&a);
+}
+
+static void transaction_object_readers_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	struct txobj_thread_list_node *a_node = NULL;
+	struct txobj_thread_list_node *b_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &a, 100, &b, 120), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&a, &object, &original, TRANSACTION_ACCESS_READ, NULL, &a_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&b, &object, &original, TRANSACTION_ACCESS_READ, NULL, &b_node), 0);
+
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_FALSE(test, list_empty(&a_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&b_node->object_list));
+	KUNIT_EXPECT_EQ(test, transaction_status(a.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_EQ(test, transaction_status(b.transaction), TRANSACTION_ACTIVE);
+
+	transaction_object_remove_ownership(a_node);
+	KUNIT_EXPECT_TRUE(test, list_empty(&a_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&object.readers));
+	transaction_object_remove_ownership(b_node);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+
+	transaction_object_test_cleanup(&b, b_node);
+	transaction_object_test_cleanup(&a, a_node);
+}
+
+static void transaction_object_reader_wins_test(struct kunit *test) {
+	struct transaction_contention_test_context reader = { };
+	struct transaction_contention_test_context writer = { };
+	struct txobj_thread_list_node *reader_node = NULL;
+	struct txobj_thread_list_node *writer_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+	bool should_sleep = false;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &reader, 100, &writer, 120), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&reader, &object, &original, TRANSACTION_ACCESS_READ, NULL, &reader_node), 0);
+	KUNIT_EXPECT_EQ(test, transaction_object_test_acquire(&writer, &object, &original, TRANSACTION_ACCESS_READ_WRITE,
+							     &should_sleep, &writer_node), -ECANCELED);
+
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+	KUNIT_EXPECT_EQ(test, transaction_status(reader.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_EQ(test, transaction_status(writer.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_FALSE(test, list_empty(&reader_node->object_list));
+	KUNIT_EXPECT_TRUE(test, list_empty(&writer_node->object_list));
+
+	transaction_object_test_cleanup(&writer, writer_node);
+	transaction_object_test_cleanup(&reader, reader_node);
+}
+
+static void transaction_object_writer_wins_test(struct kunit *test) {
+	struct transaction_contention_test_context reader = { };
+	struct transaction_contention_test_context writer = { };
+	struct txobj_thread_list_node *reader_node = NULL;
+	struct txobj_thread_list_node *writer_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &reader, 120, &writer, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&reader, &object, &original, TRANSACTION_ACCESS_READ, NULL, &reader_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&writer, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &writer_node), 0);
+
+	KUNIT_EXPECT_EQ(test, transaction_status(reader.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_EQ(test, transaction_status(writer.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, writer.transaction);
+	KUNIT_EXPECT_TRUE(test, list_empty(&reader_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&writer_node->object_list));
+
+	transaction_object_test_cleanup(&writer, writer_node);
+	transaction_object_test_cleanup(&reader, reader_node);
+}
+
+static void transaction_object_writer_conflict_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	struct txobj_thread_list_node *a_node = NULL;
+	struct txobj_thread_list_node *b_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &a, 120, &b, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&a, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &a_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&b, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &b_node), 0);
+
+	KUNIT_EXPECT_EQ(test, transaction_status(a.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, b.transaction);
+	KUNIT_EXPECT_TRUE(test, list_empty(&a_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&b_node->object_list));
+
+	transaction_object_test_cleanup(&b, b_node);
+	transaction_object_test_cleanup(&a, a_node);
+}
+
+static void transaction_file_owner_not_displaced_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct transaction_contention_test_context contender = { };
+	struct txobj_thread_list_node *owner_node = NULL;
+	struct txobj_thread_list_node *contender_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+	bool should_sleep = false;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_FILE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &owner, 120, &contender, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &owner_node), 0);
+	KUNIT_EXPECT_EQ(test, transaction_object_test_acquire(&contender, &object, &original, TRANSACTION_ACCESS_READ_WRITE,
+							     &should_sleep, &contender_node), -ECANCELED);
+
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_EQ(test, transaction_status(contender.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, owner.transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&owner_node->object_list));
+	KUNIT_EXPECT_TRUE(test, list_empty(&contender_node->object_list));
+
+	transaction_object_test_cleanup(&contender, contender_node);
+	transaction_object_test_cleanup(&owner, owner_node);
+}
+
+static void transaction_object_upgrade_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	struct txobj_thread_list_node *a_node = NULL;
+	struct txobj_thread_list_node *b_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &a, 100, &b, 120), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&a, &object, &original, TRANSACTION_ACCESS_READ, NULL, &a_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&b, &object, &original, TRANSACTION_ACCESS_READ, NULL, &b_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_acquire(a.transaction, a_node, TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
+
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, a.transaction);
+	KUNIT_EXPECT_EQ(test, a_node->rw, TRANSACTION_ACCESS_READ_WRITE);
+	KUNIT_EXPECT_EQ(test, transaction_status(b.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_TRUE(test, list_empty(&b_node->object_list));
+
+	transaction_object_test_cleanup(&b, b_node);
+	transaction_object_test_cleanup(&a, a_node);
+}
+
+static void transaction_object_upgrade_loses_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	struct txobj_thread_list_node *a_node = NULL;
+	struct txobj_thread_list_node *b_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+	bool should_sleep = false;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &a, 120, &b, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&a, &object, &original, TRANSACTION_ACCESS_READ, NULL, &a_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&b, &object, &original, TRANSACTION_ACCESS_READ, NULL, &b_node), 0);
+	KUNIT_EXPECT_EQ(test, transaction_object_acquire(a.transaction, a_node, TRANSACTION_ACCESS_READ_WRITE, &should_sleep), -ECANCELED);
+
+	KUNIT_EXPECT_TRUE(test, should_sleep);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_EQ(test, a_node->rw, TRANSACTION_ACCESS_READ);
+	KUNIT_EXPECT_EQ(test, transaction_status(a.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_FALSE(test, list_empty(&a_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&b_node->object_list));
+
+	transaction_object_test_cleanup(&b, b_node);
+	transaction_object_test_cleanup(&a, a_node);
+}
+
+static void transaction_object_reuse_test(struct kunit *test) {
+	struct transaction_contention_test_context a = { };
+	struct transaction_contention_test_context b = { };
+	struct txobj_thread_list_node *a_node = NULL;
+	struct txobj_thread_list_node *b_node = NULL;
+	struct transaction_object object;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &a, 100, &b, 120), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&a, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &a_node), 0);
+	transaction_object_remove_ownership(a_node);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&b, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &b_node), 0);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, b.transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&b_node->object_list));
+
+	transaction_object_test_cleanup(&b, b_node);
+	transaction_object_test_cleanup(&a, a_node);
+}
+
+static void transaction_finish_order_test(struct kunit *test) {
+	static const unsigned int insertion_order[] = { 1, 0 };
+	static const int expected_events[] = {
+		1, 11, 2, 12, 4, 14, 15, 5, 16, 6, 7, 17,
+	};
+	struct transaction_finish_test_context contexts[2];
+	struct transaction_finish_test_log log = { };
+	struct txobj_thread_list_node *nodes[2];
+	struct transaction_object objects[2];
+	unsigned long originals[2];
+	struct transaction *transaction;
+	unsigned int i;
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+
+	for (i = 0; i < ARRAY_SIZE(insertion_order); i++) {
+		unsigned int index = insertion_order[i];
+
+		transaction_object_init(&objects[index], TRANSACTION_OBJECT_CUSTOM);
+		contexts[index] = (struct transaction_finish_test_context) {
+			.log = &log,
+			.object = &objects[index],
+			.transaction = transaction,
+			.id = index,
+		};
+		nodes[index] = transaction_workset_node_alloc(&contexts[index], &originals[index], &objects[index],
+							     TRANSACTION_OBJECT_CUSTOM, TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, nodes[index]);
+		nodes[index]->lock = transaction_finish_test_lock;
+		nodes[index]->unlock = transaction_finish_test_unlock;
+		nodes[index]->validate = transaction_finish_test_validate;
+		nodes[index]->commit = transaction_finish_test_commit;
+		nodes[index]->release = transaction_finish_test_release;
+		KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, nodes[index]), 0);
+		KUNIT_ASSERT_EQ(test, transaction_object_acquire(transaction, nodes[index], TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
+	}
+
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, log.count, ARRAY_SIZE(expected_events));
+	for (i = 0; i < ARRAY_SIZE(expected_events); i++)
+		KUNIT_EXPECT_EQ(test, log.events[i], expected_events[i]);
+
+	for (i = 0; i < ARRAY_SIZE(contexts); i++) {
+		KUNIT_EXPECT_FALSE(test, contexts[i].validate_locked);
+		KUNIT_EXPECT_FALSE(test, contexts[i].validate_owned);
+		KUNIT_EXPECT_TRUE(test, contexts[i].commit_locked);
+		KUNIT_EXPECT_TRUE(test, contexts[i].commit_unowned);
+		KUNIT_EXPECT_TRUE(test, contexts[i].release_unlocked);
+		KUNIT_EXPECT_TRUE(test, contexts[i].release_detached);
+		KUNIT_EXPECT_PTR_EQ(test, objects[i].writer, NULL);
+		KUNIT_EXPECT_TRUE(test, list_empty(&objects[i].readers));
+	}
+	transaction_put(transaction);
+}
+
+static void transaction_abort_before_final_commit_test(struct kunit *test) {
+	struct transaction_finish_race_context context = { };
+	struct txobj_thread_list_node *node;
+	struct transaction_object object;
+	struct task_struct *end_task;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	context.transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, context.transaction);
+	init_completion(&context.blocking_lock);
+	init_completion(&context.resume);
+	init_completion(&context.done);
+	context.end_ret = -EINPROGRESS;
+	KUNIT_ASSERT_EQ(test, begin_transaction(context.transaction), 0);
+	node = transaction_workset_node_alloc(&context, &original, &object, TRANSACTION_OBJECT_CUSTOM,
+					     TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, node);
+	node->lock = transaction_finish_race_lock;
+	node->commit = transaction_finish_race_commit;
+	node->abort = transaction_finish_race_abort;
+	KUNIT_ASSERT_EQ(test, transaction_workset_add(context.transaction, node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_acquire(context.transaction, node, TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
+
+	end_task = kthread_run(transaction_finish_thread, &context, "transaction-finish-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, end_task);
+	wait_for_completion(&context.blocking_lock);
+	KUNIT_EXPECT_EQ(test, transaction_status(context.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_EQ(test, atomic_read(&context.transaction->finishing), 1);
+	KUNIT_EXPECT_EQ(test, transaction_object_acquire(context.transaction, node, TRANSACTION_ACCESS_READ_WRITE, NULL), -EBUSY);
+	KUNIT_EXPECT_EQ(test, abort_transaction(context.transaction), 0);
+	complete(&context.resume);
+	wait_for_completion(&context.done);
+	kthread_stop(end_task);
+
+	KUNIT_EXPECT_EQ(test, context.end_ret, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, context.commit_count, 0);
+	KUNIT_EXPECT_EQ(test, context.abort_count, 1);
+	KUNIT_EXPECT_TRUE(test, inactive_transaction(context.transaction));
+	KUNIT_EXPECT_EQ(test, atomic_read(&context.transaction->finishing), 0);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+	transaction_put(context.transaction);
+}
+
+static void __maybe_unused transaction_validation_failure_test(struct kunit *test) {
+	struct transaction_workset_test_context context = { };
+	struct txobj_thread_list_node *node;
+	struct transaction_object object;
+	struct transaction *transaction;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	node = transaction_workset_node_alloc(&context, &original, &object, TRANSACTION_OBJECT_CUSTOM,
+					     TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, node);
+	node->validate = transaction_validation_fail;
+	node->commit = transaction_workset_commit;
+	node->abort = transaction_workset_abort;
+	node->release = transaction_workset_release;
+	KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_acquire(transaction, node, TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
+
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ESTALE);
+	KUNIT_EXPECT_EQ(test, context.commit_count, 0);
+	KUNIT_EXPECT_EQ(test, context.abort_count, 1);
+	KUNIT_EXPECT_EQ(test, context.release_count, 1);
+	KUNIT_EXPECT_EQ(test, transaction->count, 1U);
+	KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+	transaction_put(transaction);
+}
+
 static void transaction_initial_state_test(struct kunit *test) {
 	struct transaction *transaction;
 
@@ -78,6 +757,7 @@ static void transaction_initial_state_test(struct kunit *test) {
 	KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
 	KUNIT_EXPECT_EQ(test, refcount_read(&transaction->ref_count), 1U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&transaction->task_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&transaction->finishing), 0);
 	KUNIT_EXPECT_TRUE(test, list_empty(&transaction->tasks));
 	KUNIT_EXPECT_TRUE(test, transaction_workset_empty(transaction));
 	transaction_put(transaction);
@@ -415,12 +1095,17 @@ static void transaction_file_offset_abort_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
+	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&file->transaction_object.readers));
 	file->f_pos = 29;
 	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
 	file->f_pos = 41;
 	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, transaction_file_snapshot(file), -ECANCELED);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
 	KUNIT_EXPECT_EQ(test, file->f_pos, 17);
+	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&file->transaction_object.readers));
 	transaction_detach_task(current);
 	transaction_put(transaction);
 	fput(file);
@@ -441,9 +1126,13 @@ static void transaction_file_offset_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
+	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&file->transaction_object.readers));
 	file->f_pos = 41;
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, file->f_pos, 41);
+	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&file->transaction_object.readers));
 	transaction_detach_task(current);
 	transaction_put(transaction);
 	fput(file);
@@ -532,6 +1221,22 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_syscall_abort_test),
 	KUNIT_CASE(transaction_live_fork_test),
 	KUNIT_CASE(transaction_commit_abort_race_test),
+	KUNIT_CASE(transaction_contention_priority_test),
+	KUNIT_CASE(transaction_contention_timestamp_test),
+	KUNIT_CASE(transaction_contention_aborted_test),
+	KUNIT_CASE(transaction_contention_committing_test),
+	KUNIT_CASE(transaction_object_readers_test),
+	KUNIT_CASE(transaction_object_reader_wins_test),
+	KUNIT_CASE(transaction_object_writer_wins_test),
+	KUNIT_CASE(transaction_object_writer_conflict_test),
+	KUNIT_CASE(transaction_file_owner_not_displaced_test),
+	KUNIT_CASE(transaction_object_upgrade_test),
+	KUNIT_CASE(transaction_object_upgrade_loses_test),
+	KUNIT_CASE(transaction_object_reuse_test),
+	KUNIT_CASE(transaction_finish_order_test),
+	KUNIT_CASE(transaction_abort_before_final_commit_test),
+	// TODO: Re-enable when transaction_finish_workset() runs optional validation callbacks.
+	// KUNIT_CASE(transaction_validation_failure_test),
 	{}
 };
 

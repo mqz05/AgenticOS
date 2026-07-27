@@ -53,6 +53,9 @@ struct transaction {
 	// Transaction status word.
 	atomic_t status;
 
+	// Serializes end_transaction() while status remains abortable.
+	atomic_t finishing;
+
 	// Automatic retry policy and transaction timestamp.
 	int autoretry;
 	u64 timestamp;
@@ -75,7 +78,7 @@ struct transaction {
 	// The wait queue for commit.
 	wait_queue_head_t siblings;
 
-	// Protects the tasks list.
+	// Protects the tasks list, state transitions, and ownership publication.
 	spinlock_t lock;
 };
 
@@ -124,6 +127,10 @@ struct txobj_thread_list_node {
 	void *orig_obj;
 	struct transaction_object *tx_obj;
 	enum transaction_access_mode rw;
+	/*
+	 * TODO: Optional validation may return an errno to abort before commit. The
+	 * other callbacks are expected to succeed; nonzero returns warn.
+	 */
 	int (*validate)(struct txobj_thread_list_node *node);
 	int (*lock)(struct txobj_thread_list_node *node, int blocking);
 	int (*unlock)(struct txobj_thread_list_node *node, int blocking);
@@ -133,6 +140,12 @@ struct txobj_thread_list_node {
 };
 
 void transaction_object_init(struct transaction_object *object, enum transaction_object_type type);
+int transaction_object_acquire(struct transaction *transaction,
+			       struct txobj_thread_list_node *node,
+			       enum transaction_access_mode mode,
+			       bool *should_sleep);
+void transaction_object_remove_ownership_locked(struct txobj_thread_list_node *node);
+void transaction_object_remove_ownership(struct txobj_thread_list_node *node);
 
 struct txobj_thread_list_node *transaction_workset_node_alloc(void *shadow_obj,
                                                               void *orig_obj,
@@ -149,8 +162,6 @@ struct txobj_thread_list_node *transaction_workset_find_object(struct transactio
 struct txobj_thread_list_node *transaction_workset_remove(struct transaction *transaction,
                                                           struct txobj_thread_list_node *node);
 bool transaction_workset_empty(struct transaction *transaction);
-void transaction_commit_workset(struct transaction * transaction);
-void transaction_abort_workset(struct transaction * transaction);
 
 void transaction_file_init(struct file *file);
 int transaction_file_snapshot(struct file *file);
@@ -165,6 +176,7 @@ bool active_transaction(const struct transaction *transaction);
 bool live_transaction(const struct transaction *transaction);
 bool committing_transaction(const struct transaction *transaction);
 bool aborting_transaction(const struct transaction *transaction);
+bool transaction_contention_manager(struct transaction *a, struct transaction *b, bool *should_sleep);
 
 int begin_transaction(struct transaction *transaction);
 int abort_transaction(struct transaction *transaction);
