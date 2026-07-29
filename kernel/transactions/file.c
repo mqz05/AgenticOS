@@ -14,7 +14,6 @@
    which is the current offset for read/write/lseek on this open file. */
 struct transaction_file_shadow {
 	loff_t f_pos;
-	bool restore;
 };
 
 /* Initialize the generic transaction object embedded in the file struct. */
@@ -23,14 +22,13 @@ void transaction_file_init(struct file * file) {
 }
 EXPORT_SYMBOL_GPL(transaction_file_init);
 
-/* Abort callback for file workset entries.
-   Restore the file offset captured when the file was first touched inside the transaction. */
-static int transaction_file_abort(struct txobj_thread_list_node * node) {
+/* Commit callback for file workset entries.
+   Publish the transaction-local file offset once the transaction commits. */
+static int transaction_file_commit(struct txobj_thread_list_node * node) {
 	struct transaction_file_shadow * shadow = node->shadow_obj;
 	struct file *file = node->orig_obj;
 
-	if (shadow->restore)
-		file->f_pos = shadow->f_pos;
+	file->f_pos = shadow->f_pos;
 
 	return 0;
 }
@@ -68,10 +66,31 @@ static int transaction_file_release(struct txobj_thread_list_node * node, int ea
 	return 0;
 }
 
-/* Add this file to the current transaction's workset and snapshot its original offset.
+/* Return the file offset visible to the current transaction. */
+loff_t transaction_file_get_pos(struct file * file) {
+	struct txobj_thread_list_node *node;
+	struct transaction_file_shadow *shadow;
+	struct transaction *transaction;
+
+	if (!file)
+		return 0;
+
+	transaction = current_transaction();
+	if (!transaction)
+		return file->f_pos;
+
+	node = transaction_workset_find_object(transaction, &file->transaction_object);
+	if (!node)
+		return file->f_pos;
+
+	shadow = node->shadow_obj;
+	return shadow->f_pos;
+}
+EXPORT_SYMBOL_GPL(transaction_file_get_pos);
+
+/* Add this file to the current transaction's workset and snapshot its current offset.
    If the current task is not in a live transaction, this is a no-op.
-   If the file is already in the workset, the original snapshot is reused so abort
-   restores the offset from the first transactional touch. */
+   If the file is already in the workset, the existing shadow offset is reused. */
 int transaction_file_snapshot(struct file * file) {
 	struct txobj_thread_list_node * node;
 	struct transaction_file_shadow * shadow;
@@ -99,7 +118,7 @@ int transaction_file_snapshot(struct file * file) {
 	if (!shadow)
 		return -ENOMEM;
 
-	shadow->restore = false;
+	shadow->f_pos = file->f_pos;
 	node = transaction_workset_node_alloc(
 		shadow,
 		file,
@@ -113,11 +132,11 @@ int transaction_file_snapshot(struct file * file) {
 		return -ENOMEM;
 	}
 
-	/* File workset callbacks. Commit does not need to publish anything yet because f_pos is updated in place;
-	   abort restores the saved offset. */
+	/* File workset callbacks. Runtime updates go to the shadow offset;
+	   commit publishes that offset and abort discards it. */
 	node->lock = transaction_file_lock;
 	node->unlock = transaction_file_unlock;
-	node->abort = transaction_file_abort;
+	node->commit = transaction_file_commit;
 	node->release = transaction_file_release;
 	get_file(file);
 	ret = transaction_workset_add(transaction, node);
@@ -125,11 +144,8 @@ int transaction_file_snapshot(struct file * file) {
 		goto free_node;
 
 	ret = transaction_object_acquire(transaction, node, TRANSACTION_ACCESS_READ_WRITE, NULL);
-	if (!ret) {
-		shadow->f_pos = file->f_pos;
-		shadow->restore = true;
+	if (!ret)
 		return 0;
-	}
 
 	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
 		return ret;
@@ -144,3 +160,35 @@ free_node:
 	return ret == -EEXIST ? 0 : ret;
 }
 EXPORT_SYMBOL_GPL(transaction_file_snapshot);
+
+/* Update the file offset visible to the current transaction. */
+int transaction_file_set_pos(struct file * file, loff_t pos) {
+	struct txobj_thread_list_node *node;
+	struct transaction_file_shadow *shadow;
+	struct transaction *transaction;
+	int ret;
+
+	if (!file)
+		return -EINVAL;
+
+	transaction = current_transaction();
+	if (!transaction) {
+		file->f_pos = pos;
+		return 0;
+	}
+
+	ret = transaction_file_snapshot(file);
+	if (ret)
+		return ret;
+
+	node = transaction_workset_find_object(transaction, &file->transaction_object);
+	if (!node) {
+		file->f_pos = pos;
+		return 0;
+	}
+
+	shadow = node->shadow_obj;
+	shadow->f_pos = pos;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_file_set_pos);

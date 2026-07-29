@@ -39,6 +39,23 @@ static inline bool unsigned_offsets(struct file *file)
 	return file->f_op->fop_flags & FOP_UNSIGNED_OFFSET;
 }
 
+static inline loff_t rw_transaction_file_get_pos(struct file * file) {
+#ifdef CONFIG_TRANSACTIONS
+	return transaction_file_get_pos(file);
+#else
+	return file->f_pos;
+#endif
+}
+
+static inline int rw_transaction_file_set_pos(struct file * file, loff_t pos) {
+#ifdef CONFIG_TRANSACTIONS
+	return transaction_file_set_pos(file, pos);
+#else
+	file->f_pos = pos;
+	return 0;
+#endif
+}
+
 /**
  * vfs_setpos_cookie - update the file offset for lseek and reset cookie
  * @file:	file structure in question
@@ -60,14 +77,11 @@ static loff_t vfs_setpos_cookie(struct file *file, loff_t offset,
 	if (offset > maxsize)
 		return -EINVAL;
 
-	if (offset != file->f_pos) {
-		/* lseek changes the shared file offset.
-		Snapshot the original offset before updating it so xabort() can restore it. */
-		int ret = transaction_file_snapshot(file);
+	if (offset != rw_transaction_file_get_pos(file)) {
+		int ret = rw_transaction_file_set_pos(file, offset);
 
 		if (ret)
 			return ret;
-		file->f_pos = offset;
 		if (cookie)
 			*cookie = 0;
 	}
@@ -119,7 +133,7 @@ static int must_set_pos(struct file *file, loff_t *offset, int whence, loff_t eo
 		 * write() or lseek() might have altered it
 		 */
 		if (*offset == 0) {
-			*offset = file->f_pos;
+			*offset = rw_transaction_file_get_pos(file);
 			return 0;
 		}
 		break;
@@ -183,9 +197,9 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		 */
 		if (file_seek_cur_needs_f_lock(file)) {
 			guard(spinlock)(&file->f_lock);
-			return vfs_setpos(file, file->f_pos + offset, maxsize);
+			return vfs_setpos(file, rw_transaction_file_get_pos(file) + offset, maxsize);
 		}
-		return vfs_setpos(file, file->f_pos + offset, maxsize);
+		return vfs_setpos(file, rw_transaction_file_get_pos(file) + offset, maxsize);
 	}
 
 	return vfs_setpos(file, offset, maxsize);
@@ -231,7 +245,7 @@ loff_t generic_llseek_cookie(struct file *file, loff_t offset, int whence,
 
 	/* No need to hold f_lock because we know that f_pos_lock is held. */
 	if (whence == SEEK_CUR)
-		return vfs_setpos_cookie(file, file->f_pos + offset, maxsize, cookie);
+		return vfs_setpos_cookie(file, rw_transaction_file_get_pos(file) + offset, maxsize, cookie);
 
 	return vfs_setpos_cookie(file, offset, maxsize, cookie);
 }
@@ -329,7 +343,7 @@ EXPORT_SYMBOL(no_seek_end_llseek_size);
  */
 loff_t noop_llseek(struct file *file, loff_t offset, int whence)
 {
-	return file->f_pos;
+	return rw_transaction_file_get_pos(file);
 }
 EXPORT_SYMBOL(noop_llseek);
 
@@ -347,10 +361,10 @@ loff_t default_llseek(struct file *file, loff_t offset, int whence)
 			break;
 		case SEEK_CUR:
 			if (offset == 0) {
-				retval = file->f_pos;
+				retval = rw_transaction_file_get_pos(file);
 				goto out;
 			}
-			offset += file->f_pos;
+			offset += rw_transaction_file_get_pos(file);
 			break;
 		case SEEK_DATA:
 			/*
@@ -378,13 +392,10 @@ loff_t default_llseek(struct file *file, loff_t offset, int whence)
 	}
 	retval = -EINVAL;
 	if (offset >= 0 || unsigned_offsets(file)) {
-		if (offset != file->f_pos) {
-			/* Some filesystems use default_llseek() instead of generic helper.
-			   Snapshot here as well before f_pos changes. */
-			retval = transaction_file_snapshot(file);
+		if (offset != rw_transaction_file_get_pos(file)) {
+			retval = rw_transaction_file_set_pos(file, offset);
 			if (retval)
 				goto out;
-			file->f_pos = offset;
 		}
 		retval = offset;
 	}
@@ -721,17 +732,17 @@ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
 	if (!fd_empty(f)) {
 		loff_t pos, *ppos = file_ppos(fd_file(f));
 		if (ppos) {
-			pos = *ppos;
+			pos = rw_transaction_file_get_pos(fd_file(f));
 			ppos = &pos;
 		}
 		if (ppos)
-			/* read() advances file->f_pos through the local pos copy.
-		       Snapshot before I/O so abort restores the pre-read offset. */
 			ret = transaction_file_snapshot(fd_file(f));
+		else
+			ret = 0;
 		if (!ret)
 			ret = vfs_read(fd_file(f), buf, count, ppos);
 		if (ret >= 0 && ppos)
-			fd_file(f)->f_pos = pos;
+			ret = rw_transaction_file_set_pos(fd_file(f), pos) ?: ret;
 	}
 	return ret;
 }
@@ -749,17 +760,17 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
 	if (!fd_empty(f)) {
 		loff_t pos, *ppos = file_ppos(fd_file(f));
 		if (ppos) {
-			pos = *ppos;
+			pos = rw_transaction_file_get_pos(fd_file(f));
 			ppos = &pos;
 		}
 		if (ppos)
-			/* write() advances file->f_pos through the local pos copy.
-		       Snapshot before I/O so abort restores the pre-write offset. */
 			ret = transaction_file_snapshot(fd_file(f));
+		else
+			ret = 0;
 		if (!ret)
 			ret = vfs_write(fd_file(f), buf, count, ppos);
 		if (ret >= 0 && ppos)
-			fd_file(f)->f_pos = pos;
+			ret = rw_transaction_file_set_pos(fd_file(f), pos) ?: ret;
 	}
 
 	return ret;
@@ -1096,17 +1107,17 @@ static ssize_t do_readv(unsigned long fd, const struct iovec __user *vec,
 	if (!fd_empty(f)) {
 		loff_t pos, *ppos = file_ppos(fd_file(f));
 		if (ppos) {
-			pos = *ppos;
+			pos = rw_transaction_file_get_pos(fd_file(f));
 			ppos = &pos;
 		}
 		if (ppos)
-			/* readv() shares the same file-position semantics as read().
-			   Snapshot before vector I/O advances the offset. */
 			ret = transaction_file_snapshot(fd_file(f));
+		else
+			ret = 0;
 		if (!ret)
 			ret = vfs_readv(fd_file(f), vec, vlen, ppos, flags);
 		if (ret >= 0 && ppos)
-			fd_file(f)->f_pos = pos;
+			ret = rw_transaction_file_set_pos(fd_file(f), pos) ?: ret;
 	}
 
 	if (ret > 0)
@@ -1124,17 +1135,17 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
 	if (!fd_empty(f)) {
 		loff_t pos, *ppos = file_ppos(fd_file(f));
 		if (ppos) {
-			pos = *ppos;
+			pos = rw_transaction_file_get_pos(fd_file(f));
 			ppos = &pos;
 		}
 		if (ppos)
-			/* writev() shares the same file-position semantics as write().
-		       Snapshot before vector I/O advances the offset. */
 			ret = transaction_file_snapshot(fd_file(f));
+		else
+			ret = 0;
 		if (!ret)
 			ret = vfs_writev(fd_file(f), vec, vlen, ppos, flags);
 		if (ret >= 0 && ppos)
-			fd_file(f)->f_pos = pos;
+			ret = rw_transaction_file_set_pos(fd_file(f), pos) ?: ret;
 	}
 
 	if (ret > 0)
@@ -1350,7 +1361,7 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 	if (!(fd_file(in)->f_mode & FMODE_READ))
 		return -EBADF;
 	if (!ppos) {
-		pos = fd_file(in)->f_pos;
+		pos = rw_transaction_file_get_pos(fd_file(in));
 	} else {
 		pos = *ppos;
 		if (!(fd_file(in)->f_mode & FMODE_PREAD))
@@ -1372,7 +1383,7 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 		return -EBADF;
 	in_inode = file_inode(fd_file(in));
 	out_inode = file_inode(fd_file(out));
-	out_pos = fd_file(out)->f_pos;
+	out_pos = rw_transaction_file_get_pos(fd_file(out));
 
 	if (!max)
 		max = min(in_inode->i_sb->s_maxbytes, out_inode->i_sb->s_maxbytes);
@@ -1399,12 +1410,28 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 		retval = rw_verify_area(WRITE, fd_file(out), &out_pos, count);
 		if (retval < 0)
 			return retval;
+		if (!ppos) {
+			retval = transaction_file_snapshot(fd_file(in));
+			if (retval)
+				return retval;
+		}
+		retval = transaction_file_snapshot(fd_file(out));
+		if (retval)
+			return retval;
 		retval = do_splice_direct(fd_file(in), &pos, fd_file(out), &out_pos,
 					  count, fl);
 	} else {
 		if (fd_file(out)->f_flags & O_NONBLOCK)
 			fl |= SPLICE_F_NONBLOCK;
 
+		if (!ppos) {
+			retval = transaction_file_snapshot(fd_file(in));
+			if (retval)
+				return retval;
+		}
+		retval = transaction_file_snapshot(fd_file(out));
+		if (retval)
+			return retval;
 		retval = splice_file_to_pipe(fd_file(in), opipe, &pos, count, fl);
 	}
 
@@ -1413,11 +1440,11 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 		add_wchar(current, retval);
 		fsnotify_access(fd_file(in));
 		fsnotify_modify(fd_file(out));
-		fd_file(out)->f_pos = out_pos;
+		retval = rw_transaction_file_set_pos(fd_file(out), out_pos) ?: retval;
 		if (ppos)
 			*ppos = pos;
 		else
-			fd_file(in)->f_pos = pos;
+			retval = rw_transaction_file_set_pos(fd_file(in), pos) ?: retval;
 	}
 
 	inc_syscr(current);
@@ -1697,18 +1724,29 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
 		if (copy_from_user(&pos_in, off_in, sizeof(loff_t)))
 			return -EFAULT;
 	} else {
-		pos_in = fd_file(f_in)->f_pos;
+		pos_in = rw_transaction_file_get_pos(fd_file(f_in));
 	}
 
 	if (off_out) {
 		if (copy_from_user(&pos_out, off_out, sizeof(loff_t)))
 			return -EFAULT;
 	} else {
-		pos_out = fd_file(f_out)->f_pos;
+		pos_out = rw_transaction_file_get_pos(fd_file(f_out));
 	}
 
 	if (flags != 0)
 		return -EINVAL;
+
+	if (!off_in) {
+		ret = transaction_file_snapshot(fd_file(f_in));
+		if (ret)
+			return ret;
+	}
+	if (!off_out) {
+		ret = transaction_file_snapshot(fd_file(f_out));
+		if (ret)
+			return ret;
+	}
 
 	ret = vfs_copy_file_range(fd_file(f_in), pos_in, fd_file(f_out), pos_out, len,
 				  flags);
@@ -1720,14 +1758,14 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
 			if (copy_to_user(off_in, &pos_in, sizeof(loff_t)))
 				ret = -EFAULT;
 		} else {
-			fd_file(f_in)->f_pos = pos_in;
+			ret = rw_transaction_file_set_pos(fd_file(f_in), pos_in) ?: ret;
 		}
 
 		if (off_out) {
 			if (copy_to_user(off_out, &pos_out, sizeof(loff_t)))
 				ret = -EFAULT;
 		} else {
-			fd_file(f_out)->f_pos = pos_out;
+			ret = rw_transaction_file_set_pos(fd_file(f_out), pos_out) ?: ret;
 		}
 	}
 	return ret;

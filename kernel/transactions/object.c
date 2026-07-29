@@ -98,17 +98,6 @@ int transaction_object_acquire(struct transaction *transaction,
 				ret = transaction_object_lose(transaction, can_sleep, should_sleep);
 				goto out;
 			}
-			/*
-			 * TODO: File offsets are still updated in place. Do not displace
-			 * their owner until file operations update a transaction-local
-			 * shadow and a commit callback publishes it under the object
-			 * lock. Abort can then discard the shadow without restoring
-			 * shared state, and this exception can be removed.
-			 */
-			if (object->type == TRANSACTION_OBJECT_FILE) {
-				ret = transaction_object_lose(transaction, can_sleep, should_sleep);
-				goto out;
-			}
 		}
 	}
 
@@ -116,10 +105,6 @@ int transaction_object_acquire(struct transaction *transaction,
 	if (writer && writer != transaction) {
 		can_sleep = false;
 		if (transaction_contention_manager(writer, transaction, &can_sleep)) {
-			ret = transaction_object_lose(transaction, can_sleep, should_sleep);
-			goto out;
-		}
-		if (object->type == TRANSACTION_OBJECT_FILE) {
 			ret = transaction_object_lose(transaction, can_sleep, should_sleep);
 			goto out;
 		}

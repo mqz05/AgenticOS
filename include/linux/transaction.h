@@ -165,7 +165,9 @@ struct txobj_thread_list_node *transaction_workset_remove(struct transaction *tr
 bool transaction_workset_empty(struct transaction *transaction);
 
 void transaction_file_init(struct file *file);
+loff_t transaction_file_get_pos(struct file *file);
 int transaction_file_snapshot(struct file *file);
+int transaction_file_set_pos(struct file *file, loff_t pos);
 void transaction_inode_init(struct inode *inode);
 int transaction_inode_snapshot(struct inode *inode);
 

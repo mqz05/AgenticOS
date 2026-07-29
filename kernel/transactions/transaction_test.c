@@ -517,7 +517,7 @@ static void transaction_object_writer_conflict_test(struct kunit *test) {
 	transaction_object_test_cleanup(&a, a_node);
 }
 
-static void transaction_file_owner_not_displaced_test(struct kunit *test) {
+static void transaction_file_owner_displaced_test(struct kunit *test) {
 	struct transaction_contention_test_context owner = { };
 	struct transaction_contention_test_context contender = { };
 	struct txobj_thread_list_node *owner_node = NULL;
@@ -530,14 +530,14 @@ static void transaction_file_owner_not_displaced_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &owner, 120, &contender, 100), 0);
 	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original, TRANSACTION_ACCESS_READ_WRITE, NULL, &owner_node), 0);
 	KUNIT_EXPECT_EQ(test, transaction_object_test_acquire(&contender, &object, &original, TRANSACTION_ACCESS_READ_WRITE,
-							     &should_sleep, &contender_node), -ECANCELED);
+							     &should_sleep, &contender_node), 0);
 
 	KUNIT_EXPECT_TRUE(test, should_sleep);
-	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ACTIVE);
-	KUNIT_EXPECT_EQ(test, transaction_status(contender.transaction), TRANSACTION_ABORTED);
-	KUNIT_EXPECT_PTR_EQ(test, object.writer, owner.transaction);
-	KUNIT_EXPECT_FALSE(test, list_empty(&owner_node->object_list));
-	KUNIT_EXPECT_TRUE(test, list_empty(&contender_node->object_list));
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_EQ(test, transaction_status(contender.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, contender.transaction);
+	KUNIT_EXPECT_TRUE(test, list_empty(&owner_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&contender_node->object_list));
 
 	transaction_object_test_cleanup(&contender, contender_node);
 	transaction_object_test_cleanup(&owner, owner_node);
@@ -1080,8 +1080,7 @@ static void transaction_workset_abort_cleanup_test(struct kunit *test) {
 	transaction_put(transaction);
 }
 
-/* Aborting a transaction restores the file offset captured at the first
-   transactional touch. */
+/* Aborting a transaction discards the transaction-local file offset. */
 static void transaction_file_offset_abort_test(struct kunit *test) {
 	struct transaction *transaction;
 	struct file *file;
@@ -1097,9 +1096,11 @@ static void transaction_file_offset_abort_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
 	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, transaction);
 	KUNIT_EXPECT_FALSE(test, list_empty(&file->transaction_object.readers));
-	file->f_pos = 29;
+	KUNIT_ASSERT_EQ(test, transaction_file_set_pos(file, 29), 0);
 	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
-	file->f_pos = 41;
+	KUNIT_EXPECT_EQ(test, transaction_file_get_pos(file), 29);
+	KUNIT_ASSERT_EQ(test, transaction_file_set_pos(file, 41), 0);
+	KUNIT_EXPECT_EQ(test, transaction_file_get_pos(file), 41);
 	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, transaction_file_snapshot(file), -ECANCELED);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
@@ -1111,8 +1112,7 @@ static void transaction_file_offset_abort_test(struct kunit *test) {
 	fput(file);
 }
 
-/* Committing a transaction keeps the in-place file offset update and only
-   releases the saved shadow state. */
+/* Committing a transaction publishes the transaction-local file offset. */
 static void transaction_file_offset_commit_test(struct kunit *test) {
 	struct transaction *transaction;
 	struct file *file;
@@ -1128,7 +1128,9 @@ static void transaction_file_offset_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, transaction_file_snapshot(file), 0);
 	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, transaction);
 	KUNIT_EXPECT_FALSE(test, list_empty(&file->transaction_object.readers));
-	file->f_pos = 41;
+	KUNIT_ASSERT_EQ(test, transaction_file_set_pos(file, 41), 0);
+	KUNIT_EXPECT_EQ(test, file->f_pos, 17);
+	KUNIT_EXPECT_EQ(test, transaction_file_get_pos(file), 41);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, file->f_pos, 41);
 	KUNIT_EXPECT_PTR_EQ(test, file->transaction_object.writer, NULL);
@@ -1307,7 +1309,7 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_object_reader_wins_test),
 	KUNIT_CASE(transaction_object_writer_wins_test),
 	KUNIT_CASE(transaction_object_writer_conflict_test),
-	KUNIT_CASE(transaction_file_owner_not_displaced_test),
+	KUNIT_CASE(transaction_file_owner_displaced_test),
 	KUNIT_CASE(transaction_object_upgrade_test),
 	KUNIT_CASE(transaction_object_upgrade_loses_test),
 	KUNIT_CASE(transaction_object_reuse_test),
