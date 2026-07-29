@@ -532,7 +532,7 @@ static void transaction_file_owner_displaced_test(struct kunit *test) {
 	KUNIT_EXPECT_EQ(test, transaction_object_test_acquire(&contender, &object, &original, TRANSACTION_ACCESS_READ_WRITE,
 							     &should_sleep, &contender_node), 0);
 
-	KUNIT_EXPECT_TRUE(test, should_sleep);
+	KUNIT_EXPECT_FALSE(test, should_sleep);
 	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ABORTED);
 	KUNIT_EXPECT_EQ(test, transaction_status(contender.transaction), TRANSACTION_ACTIVE);
 	KUNIT_EXPECT_PTR_EQ(test, object.writer, contender.transaction);
