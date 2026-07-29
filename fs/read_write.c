@@ -61,7 +61,7 @@ static loff_t vfs_setpos_cookie(struct file *file, loff_t offset,
 		return -EINVAL;
 
 	if (offset != file->f_pos) {
-		/* lseek changes the shared file offset. 
+		/* lseek changes the shared file offset.
 		Snapshot the original offset before updating it so xabort() can restore it. */
 		int ret = transaction_file_snapshot(file);
 

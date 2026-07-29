@@ -1138,6 +1138,74 @@ static void transaction_file_offset_commit_test(struct kunit *test) {
 	fput(file);
 }
 
+static void transaction_inode_metadata_abort_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct inode *inode;
+	struct file *file;
+
+	file = anon_inode_create_getfile("[transaction-inode-test]",
+					 &transaction_test_file_operations,
+					 NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode->i_mode = S_IFREG | 0600;
+	i_uid_write(inode, 1000);
+	i_gid_write(inode, 1000);
+	inode_set_atime(inode, 1, 2);
+	inode_set_mtime(inode, 3, 4);
+	inode_set_ctime(inode, 5, 6);
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	inode->i_mode = S_IFREG | 0644;
+	i_uid_write(inode, 2000);
+	i_gid_write(inode, 2000);
+	inode_set_atime(inode, 7, 8);
+	inode_set_mtime(inode, 9, 10);
+	inode_set_ctime(inode, 11, 12);
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0600);
+	KUNIT_EXPECT_EQ(test, i_uid_read(inode), 1000U);
+	KUNIT_EXPECT_EQ(test, i_gid_read(inode), 1000U);
+	KUNIT_EXPECT_EQ(test, inode_get_atime_sec(inode), 1LL);
+	KUNIT_EXPECT_EQ(test, inode_get_atime_nsec(inode), 2L);
+	KUNIT_EXPECT_EQ(test, inode_get_mtime_sec(inode), 3LL);
+	KUNIT_EXPECT_EQ(test, inode_get_mtime_nsec(inode), 4L);
+	KUNIT_EXPECT_EQ(test, inode_get_ctime_sec(inode), 5LL);
+	KUNIT_EXPECT_EQ(test, inode_get_ctime_nsec(inode), 6L);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_inode_metadata_commit_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct inode *inode;
+	struct file *file;
+
+	file = anon_inode_create_getfile("[transaction-inode-test]",
+					 &transaction_test_file_operations,
+					 NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode->i_mode = S_IFREG | 0600;
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	inode->i_mode = S_IFREG | 0644;
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0644);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
 static void transaction_syscall_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
 	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
@@ -1217,6 +1285,8 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_workset_abort_cleanup_test),
 	KUNIT_CASE(transaction_file_offset_abort_test),
 	KUNIT_CASE(transaction_file_offset_commit_test),
+	KUNIT_CASE(transaction_inode_metadata_abort_test),
+	KUNIT_CASE(transaction_inode_metadata_commit_test),
 	KUNIT_CASE(transaction_syscall_commit_test),
 	KUNIT_CASE(transaction_syscall_abort_test),
 	KUNIT_CASE(transaction_live_fork_test),

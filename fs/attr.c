@@ -16,6 +16,7 @@
 #include <linux/fcntl.h>
 #include <linux/filelock.h>
 #include <linux/security.h>
+#include <linux/transaction.h>
 
 /**
  * setattr_should_drop_sgid - determine whether the setgid bit needs to be
@@ -541,6 +542,10 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (error)
 			return error;
 	}
+
+	error = transaction_inode_snapshot(inode);
+	if (error)
+		return error;
 
 	if (inode->i_op->setattr)
 		error = inode->i_op->setattr(idmap, dentry, attr);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Transactional VFS file-object support. 
+/* Transactional VFS file-object support.
    This currently handles per-open-file offset rollback. More file-local
    state can be added here later without changing the generic workset layer. */
 

@@ -16,6 +16,7 @@
 
 struct task_struct;
 struct file;
+struct inode;
 struct transaction;
 
 #ifdef CONFIG_TRANSACTIONS
@@ -165,6 +166,8 @@ bool transaction_workset_empty(struct transaction *transaction);
 
 void transaction_file_init(struct file *file);
 int transaction_file_snapshot(struct file *file);
+void transaction_inode_init(struct inode *inode);
+int transaction_inode_snapshot(struct inode *inode);
 
 struct transaction *transaction_alloc(gfp_t gfp);
 struct transaction *transaction_get(struct transaction *transaction);
@@ -202,6 +205,10 @@ static inline struct transaction *current_transaction(void) {
 }
 static inline void transaction_file_init(struct file *file) { }
 static inline int transaction_file_snapshot(struct file *file) {
+	return 0;
+}
+static inline void transaction_inode_init(struct inode *inode) { }
+static inline int transaction_inode_snapshot(struct inode *inode) {
 	return 0;
 }
 #endif

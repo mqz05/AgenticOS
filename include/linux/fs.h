@@ -796,6 +796,9 @@ struct inode {
 	unsigned short		i_opflags;
 	kuid_t			i_uid;
 	kgid_t			i_gid;
+#ifdef CONFIG_TRANSACTIONS
+	struct transaction_object transaction_object;
+#endif
 	unsigned int		i_flags;
 
 #ifdef CONFIG_FS_POSIX_ACL
