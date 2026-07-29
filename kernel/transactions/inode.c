@@ -40,7 +40,7 @@ static int transaction_inode_abort(struct txobj_thread_list_node * node) {
 
 /* Release callback for inode workset entries.
    The generic workset code owns the original inode, this adapter owns the shadow state
-   and the indoe reference that is acquired when the inode was added to the workset. */
+   and the inode reference that is acquired when the inode was added to the workset. */
 static int transaction_inode_release(struct txobj_thread_list_node * node, int early) {
 	struct inode * inode = node->orig_obj;
 
@@ -57,13 +57,20 @@ int transaction_inode_snapshot(struct inode * inode) {
 	struct transaction_inode_shadow * shadow;
 	struct txobj_thread_list_node * node;
 	struct transaction * transaction;
+	enum transaction_state status;
 	int ret;
 
 	if (!inode)
 		return -EINVAL;
 
 	transaction = current_transaction();
-	if (!transaction || !live_transaction(transaction))
+	if (!transaction)
+		return 0;
+
+	status = transaction_status(transaction);
+	if (status == TRANSACTION_ABORTED || status == TRANSACTION_ABORTING)
+		return -ECANCELED;
+	if (status != TRANSACTION_ACTIVE)
 		return 0;
 
 	if (transaction_workset_find_object(transaction, &inode->transaction_object))
@@ -96,9 +103,19 @@ int transaction_inode_snapshot(struct inode * inode) {
 	node->release = transaction_inode_release;
 	ihold(inode);
 	ret = transaction_workset_add(transaction, node);
+	if (ret)
+		goto free_node;
+
+	ret = transaction_object_acquire(transaction, node, TRANSACTION_ACCESS_READ_WRITE, NULL);
 	if (!ret)
 		return 0;
 
+	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
+		return ret;
+
+	transaction_workset_remove(transaction, node);
+
+free_node:
 	iput(inode);
 	kfree(shadow);
 	transaction_workset_node_free(node);
