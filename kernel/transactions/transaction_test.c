@@ -1389,6 +1389,95 @@ static void transaction_inode_metadata_commit_test(struct kunit *test) {
 	fput(file);
 }
 
+static void transaction_dentry_metadata_abort_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *dentry;
+	struct file *file;
+	unsigned int original_flags;
+	unsigned long original_time;
+	void *original_fsdata;
+
+	file = anon_inode_getfile("[transaction-dentry-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	dentry = file->f_path.dentry;
+	KUNIT_ASSERT_NOT_NULL(test, dentry);
+
+	original_flags = dentry->d_flags;
+	original_time = dentry->d_time;
+	original_fsdata = dentry->d_fsdata;
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer,
+			    transaction);
+	KUNIT_EXPECT_FALSE(test,
+			   list_empty(&dentry->transaction_object.readers));
+
+	spin_lock(&dentry->d_lock);
+	dentry->d_flags = original_flags ^ DCACHE_REFERENCED;
+	dentry->d_time = original_time + 10;
+	dentry->d_fsdata = test;
+	spin_unlock(&dentry->d_lock);
+
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, dentry->d_flags, original_flags);
+	KUNIT_EXPECT_EQ(test, dentry->d_time, original_time);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->d_fsdata, original_fsdata);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test,
+			  list_empty(&dentry->transaction_object.readers));
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_dentry_metadata_commit_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *dentry;
+	struct file *file;
+	unsigned int updated_flags;
+	unsigned long updated_time;
+
+	file = anon_inode_getfile("[transaction-dentry-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	dentry = file->f_path.dentry;
+	KUNIT_ASSERT_NOT_NULL(test, dentry);
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer,
+			    transaction);
+	KUNIT_EXPECT_FALSE(test,
+			   list_empty(&dentry->transaction_object.readers));
+
+	updated_flags = dentry->d_flags ^ DCACHE_REFERENCED;
+	updated_time = dentry->d_time + 10;
+	spin_lock(&dentry->d_lock);
+	dentry->d_flags = updated_flags;
+	dentry->d_time = updated_time;
+	dentry->d_fsdata = test;
+	spin_unlock(&dentry->d_lock);
+
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, dentry->d_flags, updated_flags);
+	KUNIT_EXPECT_EQ(test, dentry->d_time, updated_time);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->d_fsdata, test);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test,
+			  list_empty(&dentry->transaction_object.readers));
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
 static void transaction_syscall_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
 	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
@@ -1475,6 +1564,8 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_file_offset_commit_test),
 	KUNIT_CASE(transaction_inode_metadata_abort_test),
 	KUNIT_CASE(transaction_inode_metadata_commit_test),
+	KUNIT_CASE(transaction_dentry_metadata_abort_test),
+	KUNIT_CASE(transaction_dentry_metadata_commit_test),
 	KUNIT_CASE(transaction_syscall_commit_test),
 	KUNIT_CASE(transaction_syscall_abort_test),
 	KUNIT_CASE(transaction_live_fork_test),

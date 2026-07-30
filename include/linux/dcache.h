@@ -14,6 +14,7 @@
 #include <linux/lockref.h>
 #include <linux/stringhash.h>
 #include <linux/wait.h>
+#include <linux/transaction.h>
 
 struct path;
 struct file;
@@ -129,6 +130,9 @@ struct dentry {
 		struct hlist_bl_node d_in_lookup_hash;	/* only for in-lookup ones */
 	 	struct rcu_head d_rcu;
 	} d_u;
+#ifdef CONFIG_TRANSACTIONS
+	struct transaction_object transaction_object;
+#endif
 };
 
 /*

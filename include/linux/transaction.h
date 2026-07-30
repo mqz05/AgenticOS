@@ -17,6 +17,7 @@
 struct task_struct;
 struct file;
 struct inode;
+struct dentry;
 struct transaction;
 
 #ifdef CONFIG_TRANSACTIONS
@@ -181,6 +182,8 @@ int transaction_file_snapshot(struct file *file);
 int transaction_file_set_pos(struct file *file, loff_t pos);
 void transaction_inode_init(struct inode *inode);
 int transaction_inode_snapshot(struct inode *inode);
+void transaction_dentry_init(struct dentry *dentry);
+int transaction_dentry_snapshot(struct dentry *dentry);
 
 struct transaction *transaction_alloc(gfp_t gfp);
 struct transaction *transaction_get(struct transaction *transaction);
@@ -222,6 +225,10 @@ static inline int transaction_file_snapshot(struct file *file) {
 }
 static inline void transaction_inode_init(struct inode *inode) { }
 static inline int transaction_inode_snapshot(struct inode *inode) {
+	return 0;
+}
+static inline void transaction_dentry_init(struct dentry *dentry) { }
+static inline int transaction_dentry_snapshot(struct dentry *dentry) {
 	return 0;
 }
 #endif
