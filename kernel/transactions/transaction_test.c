@@ -9,6 +9,7 @@
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/transaction.h>
+#include <linux/tx_list2.h>
 
 struct transaction_race_context {
 	struct transaction *transaction;
@@ -33,6 +34,11 @@ struct transaction_workset_test_context {
 	int commit_count;
 	int abort_count;
 	int release_count;
+};
+
+struct transaction_list_test_item {
+	int value;
+	struct tx_list2_entry_ref link;
 };
 
 struct transaction_contention_test_context {
@@ -82,6 +88,62 @@ static int transaction_test_callback(struct txobj_thread_list_node *node) {
 static int transaction_test_lock_callback(struct txobj_thread_list_node *node, int blocking) {
 	atomic_inc(&transaction_callback_calls);
 	return 0;
+}
+
+static void transaction_list_test_item_init(struct transaction_list_test_item *item,
+					    int value)
+{
+	item->value = value;
+	INIT_TX_LIST2_REF(&item->link);
+}
+
+static int transaction_list_test_count(struct tx_list2_head *head)
+{
+	struct tx_list2_iterator iter;
+	int count = 0;
+	int ret;
+
+	ret = tx_list2_get_iterator(&iter, head);
+	if (ret)
+		return ret;
+	while (tx_list2_iter_next(&iter))
+		count++;
+	tx_list2_put_iterator(&iter);
+
+	return count;
+}
+
+static int transaction_test_begin_current(struct transaction **transaction_out)
+{
+	struct transaction *transaction;
+	int ret;
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	if (!transaction)
+		return -ENOMEM;
+
+	ret = transaction_attach_task(transaction, current);
+	if (ret)
+		goto put_transaction;
+
+	ret = begin_transaction(transaction);
+	if (ret)
+		goto detach_task;
+
+	*transaction_out = transaction;
+	return 0;
+
+detach_task:
+	transaction_detach_task(current);
+put_transaction:
+	transaction_put(transaction);
+	return ret;
+}
+
+static void transaction_test_finish_current(struct transaction *transaction)
+{
+	transaction_detach_task(current);
+	transaction_put(transaction);
 }
 
 static int transaction_finish_race_lock(struct txobj_thread_list_node *node, int blocking) {
@@ -1080,6 +1142,117 @@ static void transaction_workset_abort_cleanup_test(struct kunit *test) {
 	transaction_put(transaction);
 }
 
+static void transaction_list_add_commit_test(struct kunit *test) {
+	struct transaction_list_test_item item;
+	struct tx_list2_head head;
+	struct transaction *transaction;
+
+	INIT_TX_LIST2_HEAD(&head);
+	transaction_list_test_item_init(&item, 1);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 0);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&item.link, &head), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 1);
+	KUNIT_EXPECT_FALSE(test, list_empty(&head.spec_list));
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&head.spec_list));
+	KUNIT_EXPECT_PTR_EQ(test, item.link.entry.parent, &head);
+	KUNIT_EXPECT_TRUE(test, item.link.transaction == NULL);
+
+	transaction_test_finish_current(transaction);
+	tx_list2_del(&item.link);
+}
+
+static void transaction_list_add_abort_test(struct kunit *test) {
+	struct transaction_list_test_item item;
+	struct tx_list2_head head;
+	struct transaction *transaction;
+
+	INIT_TX_LIST2_HEAD(&head);
+	transaction_list_test_item_init(&item, 1);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&item.link, &head), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 1);
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&head.spec_list));
+	KUNIT_EXPECT_TRUE(test, tx_list2_unreferenced(&item.link));
+
+	transaction_test_finish_current(transaction);
+}
+
+static void transaction_list_delete_commit_test(struct kunit *test) {
+	struct transaction_list_test_item item;
+	struct tx_list2_head head;
+	struct transaction *transaction;
+
+	INIT_TX_LIST2_HEAD(&head);
+	transaction_list_test_item_init(&item, 1);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&item.link, &head), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 1);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_del(&item.link), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 0);
+	KUNIT_EXPECT_FALSE(test, list_empty(&head.spec_list));
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&head.spec_list));
+	KUNIT_EXPECT_TRUE(test, tx_list2_unreferenced(&item.link));
+
+	transaction_test_finish_current(transaction);
+}
+
+static void transaction_list_delete_abort_test(struct kunit *test) {
+	struct transaction_list_test_item item;
+	struct tx_list2_head head;
+	struct transaction *transaction;
+
+	INIT_TX_LIST2_HEAD(&head);
+	transaction_list_test_item_init(&item, 1);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&item.link, &head), 0);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_del(&item.link), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 0);
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&head.spec_list));
+	KUNIT_EXPECT_PTR_EQ(test, item.link.entry.parent, &head);
+
+	transaction_test_finish_current(transaction);
+	tx_list2_del(&item.link);
+}
+
+static void transaction_list_move_commit_test(struct kunit *test) {
+	struct transaction_list_test_item item;
+	struct tx_list2_head first;
+	struct tx_list2_head second;
+	struct transaction *transaction;
+
+	INIT_TX_LIST2_HEAD(&first);
+	INIT_TX_LIST2_HEAD(&second);
+	transaction_list_test_item_init(&item, 1);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&item.link, &first), 0);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_move(&item.link, &second), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&first), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&second), 1);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&first), 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&second), 1);
+	KUNIT_EXPECT_PTR_EQ(test, item.link.entry.parent, &second);
+
+	transaction_test_finish_current(transaction);
+	tx_list2_del(&item.link);
+}
+
 /* Aborting a transaction discards the transaction-local file offset. */
 static void transaction_file_offset_abort_test(struct kunit *test) {
 	struct transaction *transaction;
@@ -1293,6 +1466,11 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_workset_ordering_test),
 	KUNIT_CASE(transaction_workset_commit_cleanup_test),
 	KUNIT_CASE(transaction_workset_abort_cleanup_test),
+	KUNIT_CASE(transaction_list_add_commit_test),
+	KUNIT_CASE(transaction_list_add_abort_test),
+	KUNIT_CASE(transaction_list_delete_commit_test),
+	KUNIT_CASE(transaction_list_delete_abort_test),
+	KUNIT_CASE(transaction_list_move_commit_test),
 	KUNIT_CASE(transaction_file_offset_abort_test),
 	KUNIT_CASE(transaction_file_offset_commit_test),
 	KUNIT_CASE(transaction_inode_metadata_abort_test),

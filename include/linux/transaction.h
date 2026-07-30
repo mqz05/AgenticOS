@@ -70,7 +70,12 @@ struct transaction {
 	// What to do on an unsupported operation.
 	enum unsupported_behavior unsupported_operation_action;
 
+	// object_list tracks ordinary transactional objects such as files and inodes
 	struct skiplist_head object_list;
+	// list_list tracks transactional list heads separately, matching TxOS ordering:
+	// list entries are collected separately and merged into the finished workset
+	// before normal objects are committed or aborted. 
+	struct skiplist_head list_list;
 	spinlock_t workset_lock;
 
 	// The wait queue for loser transactions.
@@ -98,6 +103,7 @@ enum transaction_object_type {
 	TRANSACTION_OBJECT_ADDRESS_SPACE,
 	TRANSACTION_OBJECT_SOCKET,
 	TRANSACTION_OBJECT_TASK,
+	TRANSACTION_OBJECT_LIST_HEAD,
 	TRANSACTION_OBJECT_CUSTOM,
 };
 
@@ -163,6 +169,11 @@ struct txobj_thread_list_node *transaction_workset_find_object(struct transactio
 struct txobj_thread_list_node *transaction_workset_remove(struct transaction *transaction,
                                                           struct txobj_thread_list_node *node);
 bool transaction_workset_empty(struct transaction *transaction);
+int transaction_list_workset_add(struct transaction *transaction, struct txobj_thread_list_node *node);
+struct txobj_thread_list_node *transaction_list_workset_find_object(struct transaction *transaction,
+                                                                    struct transaction_object *tx_obj);
+struct txobj_thread_list_node *transaction_list_workset_remove(struct transaction *transaction,
+                                                               struct txobj_thread_list_node *node);
 
 void transaction_file_init(struct file *file);
 loff_t transaction_file_get_pos(struct file *file);
