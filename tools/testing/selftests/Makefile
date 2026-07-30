@@ -119,6 +119,7 @@ TARGETS += timers
 endif
 TARGETS += tmpfs
 TARGETS += tpm2
+TARGETS += transactions
 TARGETS += tty
 TARGETS += ublk
 TARGETS += uevent

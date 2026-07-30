@@ -9,6 +9,7 @@
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/transaction.h>
+#include <linux/tx_hlist.h>
 #include <linux/tx_list2.h>
 
 struct transaction_race_context {
@@ -1478,6 +1479,117 @@ static void transaction_dentry_metadata_commit_test(struct kunit *test) {
 	fput(file);
 }
 
+static void transaction_hlist_restore_test(struct kunit *test) {
+	struct tx_hlist_node_snapshot snapshot;
+	struct hlist_head head;
+	struct hlist_node first;
+	struct hlist_node second;
+
+	INIT_HLIST_HEAD(&head);
+	INIT_HLIST_NODE(&first);
+	INIT_HLIST_NODE(&second);
+	hlist_add_head(&first, &head);
+	hlist_add_head(&second, &head);
+
+	tx_hlist_snapshot(&second, &snapshot);
+	hlist_del_init(&second);
+	KUNIT_EXPECT_PTR_EQ(test, head.first, &first);
+
+	tx_hlist_restore(&second, &snapshot);
+	KUNIT_EXPECT_PTR_EQ(test, head.first, &second);
+	KUNIT_EXPECT_PTR_EQ(test, second.next, &first);
+	KUNIT_EXPECT_PTR_EQ(test, first.pprev, &second.next);
+}
+
+static void transaction_hlist_bl_restore_test(struct kunit *test) {
+	struct tx_hlist_bl_node_snapshot snapshot;
+	struct hlist_bl_head head;
+	struct hlist_bl_node first;
+	struct hlist_bl_node second;
+
+	INIT_HLIST_BL_HEAD(&head);
+	INIT_HLIST_BL_NODE(&first);
+	INIT_HLIST_BL_NODE(&second);
+	hlist_bl_lock(&head);
+	hlist_bl_add_head(&first, &head);
+	hlist_bl_add_head(&second, &head);
+
+	tx_hlist_bl_snapshot(&second, &snapshot);
+	hlist_bl_del_init(&second);
+	KUNIT_EXPECT_PTR_EQ(test, hlist_bl_first(&head), &first);
+
+	tx_hlist_bl_restore(&second, &snapshot);
+	KUNIT_EXPECT_PTR_EQ(test, hlist_bl_first(&head), &second);
+	KUNIT_EXPECT_PTR_EQ(test, second.next, &first);
+	KUNIT_EXPECT_PTR_EQ(test, first.pprev, &second.next);
+	hlist_bl_unlock(&head);
+}
+
+static void transaction_dentry_sibling_abort_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *parent;
+	struct dentry *child;
+	struct file *file;
+	struct qstr name = QSTR_INIT("txchild", 7);
+
+	file = anon_inode_getfile("[transaction-dcache-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	parent = file->f_path.dentry;
+	KUNIT_ASSERT_NOT_NULL(test, parent);
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	child = d_alloc(parent, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+	KUNIT_EXPECT_FALSE(test, hlist_unhashed(&child->d_sib));
+
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_TRUE(test, hlist_unhashed(&child->d_sib));
+	KUNIT_EXPECT_PTR_EQ(test, child->d_parent, child);
+
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	dput(child);
+	fput(file);
+}
+
+static void transaction_dentry_hash_abort_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *parent;
+	struct dentry *child;
+	struct file *file;
+	struct qstr name = QSTR_INIT("txhash", 6);
+
+	file = anon_inode_getfile("[transaction-dcache-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	parent = file->f_path.dentry;
+	KUNIT_ASSERT_NOT_NULL(test, parent);
+	child = d_alloc(parent, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+	KUNIT_ASSERT_TRUE(test, d_unhashed(child));
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	d_rehash(child);
+	KUNIT_EXPECT_FALSE(test, d_unhashed(child));
+
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_TRUE(test, d_unhashed(child));
+
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	dput(child);
+	fput(file);
+}
+
 static void transaction_syscall_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
 	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
@@ -1566,6 +1678,10 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_inode_metadata_commit_test),
 	KUNIT_CASE(transaction_dentry_metadata_abort_test),
 	KUNIT_CASE(transaction_dentry_metadata_commit_test),
+	KUNIT_CASE(transaction_hlist_restore_test),
+	KUNIT_CASE(transaction_hlist_bl_restore_test),
+	KUNIT_CASE(transaction_dentry_sibling_abort_test),
+	KUNIT_CASE(transaction_dentry_hash_abort_test),
 	KUNIT_CASE(transaction_syscall_commit_test),
 	KUNIT_CASE(transaction_syscall_abort_test),
 	KUNIT_CASE(transaction_live_fork_test),

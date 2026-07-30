@@ -452,6 +452,7 @@ static void dentry_unlink_inode(struct dentry * dentry)
 {
 	struct inode *inode = dentry->d_inode;
 
+	transaction_dentry_snapshot_locked(dentry);
 	raw_write_seqcount_begin(&dentry->d_seq);
 	__d_clear_type_and_inode(dentry);
 	hlist_del_init(&dentry->d_u.d_alias);
@@ -553,6 +554,7 @@ static void d_lru_shrink_move(struct list_lru_one *lru, struct dentry *dentry,
 static void ___d_drop(struct dentry *dentry)
 {
 	struct hlist_bl_head *b;
+	transaction_dentry_snapshot_locked(dentry);
 	/*
 	 * Hashed dentries are normally on the dentry hashtable,
 	 * with the exception of those newly allocated by
@@ -607,6 +609,7 @@ EXPORT_SYMBOL(d_drop);
 static inline void dentry_unlist(struct dentry *dentry)
 {
 	struct dentry *next;
+	transaction_dentry_snapshot_locked(dentry);
 	/*
 	 * Inform d_walk() and shrink_dentry_list() that we are no longer
 	 * attached to the dentry tree
@@ -1770,6 +1773,7 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
 	struct dentry *dentry = __d_alloc(parent->d_sb, name);
 	if (!dentry)
 		return NULL;
+	transaction_dentry_snapshot(dentry);
 	spin_lock(&parent->d_lock);
 	/*
 	 * don't need child lock because it is not subject
@@ -1932,6 +1936,7 @@ static void __d_instantiate(struct dentry *dentry, struct inode *inode)
 	if ((dentry->d_flags &
 	     (DCACHE_LRU_LIST|DCACHE_SHRINK_LIST)) == DCACHE_LRU_LIST)
 		this_cpu_dec(nr_dentry_negative);
+	transaction_dentry_snapshot_locked(dentry);
 	hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
 	raw_write_seqcount_begin(&dentry->d_seq);
 	__d_set_inode_and_type(dentry, inode, add_flags);
@@ -2486,6 +2491,7 @@ static void __d_rehash(struct dentry *entry)
 {
 	struct hlist_bl_head *b = d_hash(entry->d_name.hash);
 
+	transaction_dentry_snapshot_locked(entry);
 	hlist_bl_lock(b);
 	hlist_bl_add_head_rcu(&entry->d_hash, b);
 	hlist_bl_unlock(b);
@@ -2836,6 +2842,8 @@ static void __d_move(struct dentry *dentry, struct dentry *target,
 	}
 	spin_lock_nested(&dentry->d_lock, 2);
 	spin_lock_nested(&target->d_lock, 3);
+	transaction_dentry_snapshot_locked(dentry);
+	transaction_dentry_snapshot_locked(target);
 
 	if (unlikely(d_in_lookup(target))) {
 		dir = target->d_parent->d_inode;
