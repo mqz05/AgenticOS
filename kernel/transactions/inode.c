@@ -11,6 +11,8 @@ struct transaction_inode_shadow {
 	umode_t i_mode;
 	kuid_t i_uid;
 	kgid_t i_gid;
+	unsigned int i_nlink;
+	unsigned int i_flags;
 	struct timespec64 i_atime;
 	struct timespec64 i_mtime;
 	struct timespec64 i_ctime;
@@ -31,6 +33,8 @@ static int transaction_inode_abort(struct txobj_thread_list_node * node) {
 	inode->i_mode = shadow->i_mode;
 	inode->i_uid = shadow->i_uid;
 	inode->i_gid = shadow->i_gid;
+	set_nlink(inode, shadow->i_nlink);
+	inode->i_flags = shadow->i_flags;
 	inode_set_atime_to_ts(inode, shadow->i_atime);
 	inode_set_mtime_to_ts(inode, shadow->i_mtime);
 	inode_set_ctime_to_ts(inode, shadow->i_ctime);
@@ -83,6 +87,8 @@ int transaction_inode_snapshot(struct inode * inode) {
 	shadow->i_mode = inode->i_mode;
 	shadow->i_uid = inode->i_uid;
 	shadow->i_gid = inode->i_gid;
+	shadow->i_nlink = inode->i_nlink;
+	shadow->i_flags = inode->i_flags;
 	shadow->i_atime = inode_get_atime(inode);
 	shadow->i_mtime = inode_get_mtime(inode);
 	shadow->i_ctime = inode_get_ctime(inode);

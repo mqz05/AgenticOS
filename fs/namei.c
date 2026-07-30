@@ -40,6 +40,7 @@
 #include <linux/bitops.h>
 #include <linux/init_task.h>
 #include <linux/uaccess.h>
+#include <linux/transaction.h>
 
 #include "internal.h"
 #include "mount.h"
@@ -3490,6 +3491,12 @@ int vfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	error = security_inode_create(dir, dentry, mode);
 	if (error)
 		return error;
+	error = transaction_inode_snapshot(dir);
+	if (error)
+		return error;
+	error = transaction_dentry_snapshot(dentry);
+	if (error)
+		return error;
 	error = dir->i_op->create(idmap, dir, dentry, mode, want_excl);
 	if (!error)
 		fsnotify_create(dir, dentry);
@@ -4670,6 +4677,15 @@ int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
 			error = try_break_deleg(target, delegated_inode);
 			if (error)
 				goto out;
+			error = transaction_inode_snapshot(dir);
+			if (error)
+				goto out;
+			error = transaction_inode_snapshot(target);
+			if (error)
+				goto out;
+			error = transaction_dentry_snapshot(dentry);
+			if (error)
+				goto out;
 			error = dir->i_op->unlink(dir, dentry);
 			if (!error) {
 				dont_mount(dentry);
@@ -5213,6 +5229,28 @@ int vfs_rename(struct renamedata *rd)
 		if (error)
 			goto out;
 	}
+	error = transaction_inode_snapshot(old_dir);
+	if (error)
+		goto out;
+	if (new_dir != old_dir) {
+		error = transaction_inode_snapshot(new_dir);
+		if (error)
+			goto out;
+	}
+	error = transaction_inode_snapshot(source);
+	if (error)
+		goto out;
+	if (target) {
+		error = transaction_inode_snapshot(target);
+		if (error)
+			goto out;
+	}
+	error = transaction_dentry_snapshot(old_dentry);
+	if (error)
+		goto out;
+	error = transaction_dentry_snapshot(new_dentry);
+	if (error)
+		goto out;
 	error = old_dir->i_op->rename(rd->mnt_idmap, old_dir, old_dentry,
 				      new_dir, new_dentry, flags);
 	if (error)
