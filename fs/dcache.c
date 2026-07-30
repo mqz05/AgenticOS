@@ -2487,11 +2487,12 @@ void d_delete(struct dentry * dentry)
 }
 EXPORT_SYMBOL(d_delete);
 
-static void __d_rehash(struct dentry *entry)
+static void __d_rehash(struct dentry *entry, bool snapshot)
 {
 	struct hlist_bl_head *b = d_hash(entry->d_name.hash);
 
-	transaction_dentry_snapshot_locked(entry);
+	if (snapshot)
+		transaction_dentry_snapshot_locked(entry);
 	hlist_bl_lock(b);
 	hlist_bl_add_head_rcu(&entry->d_hash, b);
 	hlist_bl_unlock(b);
@@ -2507,10 +2508,17 @@ static void __d_rehash(struct dentry *entry)
 void d_rehash(struct dentry * entry)
 {
 	spin_lock(&entry->d_lock);
-	__d_rehash(entry);
+	__d_rehash(entry, true);
 	spin_unlock(&entry->d_lock);
 }
 EXPORT_SYMBOL(d_rehash);
+
+void d_rehash_no_tx_snapshot(struct dentry *entry)
+{
+	spin_lock(&entry->d_lock);
+	__d_rehash(entry, false);
+	spin_unlock(&entry->d_lock);
+}
 
 static inline unsigned start_dir_add(struct inode *dir)
 {
@@ -2718,7 +2726,7 @@ static inline void __d_add(struct dentry *dentry, struct inode *inode,
 		raw_write_seqcount_end(&dentry->d_seq);
 		fsnotify_update_flags(dentry);
 	}
-	__d_rehash(dentry);
+	__d_rehash(dentry, true);
 	if (dir)
 		end_dir_add(dir, n, d_wait);
 	spin_unlock(&dentry->d_lock);
@@ -2874,13 +2882,13 @@ static void __d_move(struct dentry *dentry, struct dentry *target,
 		if (!hlist_unhashed(&target->d_sib))
 			__hlist_del(&target->d_sib);
 		hlist_add_head(&target->d_sib, &target->d_parent->d_children);
-		__d_rehash(target);
+		__d_rehash(target, true);
 		fsnotify_update_flags(target);
 	}
 	if (!hlist_unhashed(&dentry->d_sib))
 		__hlist_del(&dentry->d_sib);
 	hlist_add_head(&dentry->d_sib, &dentry->d_parent->d_children);
-	__d_rehash(dentry);
+	__d_rehash(dentry, true);
 	fsnotify_update_flags(dentry);
 	fscrypt_handle_d_move(dentry);
 

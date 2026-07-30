@@ -4684,7 +4684,7 @@ int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
 			if (error)
 				goto out;
 			if (current_transaction() && d_unhashed(dentry))
-				d_rehash(dentry);
+				d_rehash_no_tx_snapshot(dentry);
 			error = transaction_dentry_snapshot(dentry);
 			if (error)
 				goto out;
@@ -5248,9 +5248,9 @@ int vfs_rename(struct renamedata *rd)
 			goto out;
 	}
 	if (current_transaction() && d_unhashed(old_dentry))
-		d_rehash(old_dentry);
+		d_rehash_no_tx_snapshot(old_dentry);
 	if (target && current_transaction() && d_unhashed(new_dentry))
-		d_rehash(new_dentry);
+		d_rehash_no_tx_snapshot(new_dentry);
 	error = transaction_dentry_snapshot(old_dentry);
 	if (error)
 		goto out;

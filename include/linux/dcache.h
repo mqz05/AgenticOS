@@ -282,6 +282,7 @@ extern int path_has_submounts(const struct path *);
  * This adds the entry to the hash queues.
  */
 extern void d_rehash(struct dentry *);
+extern void d_rehash_no_tx_snapshot(struct dentry *);
  
 extern void d_add(struct dentry *, struct inode *);
 
