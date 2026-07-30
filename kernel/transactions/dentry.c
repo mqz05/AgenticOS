@@ -14,6 +14,9 @@ struct transaction_dentry_shadow {
 	void *d_fsdata;
 	struct inode *d_inode;
 	struct dentry *d_parent;
+	struct qstr d_name;
+	union shortname_store d_shortname;
+	bool external_name;
 	struct tx_hlist_bl_node_snapshot d_hash;
 	struct tx_hlist_node_snapshot d_sib;
 	struct tx_hlist_node_snapshot d_alias;
@@ -42,6 +45,11 @@ static int transaction_dentry_abort(struct txobj_thread_list_node * node) {
 	struct transaction_dentry_shadow *shadow = node->shadow_obj;
 	struct dentry *dentry = node->orig_obj;
 
+	if (!shadow->external_name) {
+		dentry->d_shortname = shadow->d_shortname;
+		dentry->__d_name.name = dentry->d_shortname.string;
+		dentry->__d_name.hash_len = shadow->d_name.hash_len;
+	}
 	dentry->d_flags = shadow->d_flags;
 	dentry->d_time = shadow->d_time;
 	dentry->d_fsdata = shadow->d_fsdata;
@@ -97,6 +105,11 @@ static int __transaction_dentry_snapshot(struct dentry * dentry, bool locked) {
 	shadow->d_fsdata = dentry->d_fsdata;
 	shadow->d_inode = dentry->d_inode;
 	shadow->d_parent = dentry->d_parent;
+	shadow->external_name = dentry->d_name.name != dentry->d_shortname.string;
+	if (!shadow->external_name) {
+		shadow->d_name = dentry->d_name;
+		shadow->d_shortname = dentry->d_shortname;
+	}
 	tx_hlist_bl_snapshot(&dentry->d_hash, &shadow->d_hash);
 	tx_hlist_snapshot(&dentry->d_sib, &shadow->d_sib);
 	tx_hlist_snapshot(&dentry->d_u.d_alias, &shadow->d_alias);
