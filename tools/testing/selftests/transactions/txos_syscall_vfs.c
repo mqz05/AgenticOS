@@ -47,6 +47,14 @@ static void cleanup_namespace_fixtures(void)
 	unlink("/tmp/txos-rename-new");
 	unlink("/tmp/txos-rename-commit-old");
 	unlink("/tmp/txos-rename-commit-new");
+	unlink("/tmp/txos-link-old");
+	unlink("/tmp/txos-link-new");
+	unlink("/tmp/txos-link-commit-old");
+	unlink("/tmp/txos-link-commit-new");
+	rmdir("/tmp/txos-mkdir-abort");
+	rmdir("/tmp/txos-mkdir-commit");
+	rmdir("/tmp/txos-rmdir-abort");
+	rmdir("/tmp/txos-rmdir-commit");
 }
 
 static int create_empty_file(const char *path, mode_t mode)
@@ -66,7 +74,7 @@ int main(void)
 	int fd;
 
 	ksft_print_header();
-	ksft_set_plan(12);
+	ksft_set_plan(18);
 	cleanup_namespace_fixtures();
 
 	errno = 0;
@@ -184,6 +192,112 @@ int main(void)
 			 errno == ENOENT &&
 			 access("/tmp/txos-rename-commit-new", F_OK) == 0,
 			 "rename publish through xend\n");
+
+	create_empty_file("/tmp/txos-link-old", 0600);
+	if (xbegin() != 0) {
+		ksft_test_result_fail("link rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (link("/tmp/txos-link-old", "/tmp/txos-link-new") != 0) {
+		xabort();
+		ksft_test_result_fail("link rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xabort() != 0) {
+		ksft_test_result_fail("link rollback through xabort\n");
+		goto out_unlink;
+	}
+	ksft_test_result(access("/tmp/txos-link-old", F_OK) == 0 &&
+			 access("/tmp/txos-link-new", F_OK) == -1 &&
+			 errno == ENOENT,
+			 "link rollback through xabort\n");
+
+	create_empty_file("/tmp/txos-link-commit-old", 0600);
+	if (xbegin() != 0) {
+		ksft_test_result_fail("link publish through xend\n");
+		goto out_unlink;
+	}
+	if (link("/tmp/txos-link-commit-old",
+		 "/tmp/txos-link-commit-new") != 0) {
+		xabort();
+		ksft_test_result_fail("link publish through xend\n");
+		goto out_unlink;
+	}
+	if (xend() != 0) {
+		ksft_test_result_fail("link publish through xend\n");
+		goto out_unlink;
+	}
+	ksft_test_result(access("/tmp/txos-link-commit-old", F_OK) == 0 &&
+			 access("/tmp/txos-link-commit-new", F_OK) == 0,
+			 "link publish through xend\n");
+
+	if (xbegin() != 0) {
+		ksft_test_result_fail("mkdir rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (mkdir("/tmp/txos-mkdir-abort", 0700) != 0) {
+		xabort();
+		ksft_test_result_fail("mkdir rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xabort() != 0) {
+		ksft_test_result_fail("mkdir rollback through xabort\n");
+		goto out_unlink;
+	}
+	ksft_test_result(access("/tmp/txos-mkdir-abort", F_OK) == -1 &&
+			 errno == ENOENT,
+			 "mkdir rollback through xabort\n");
+
+	if (xbegin() != 0) {
+		ksft_test_result_fail("mkdir publish through xend\n");
+		goto out_unlink;
+	}
+	if (mkdir("/tmp/txos-mkdir-commit", 0700) != 0) {
+		xabort();
+		ksft_test_result_fail("mkdir publish through xend\n");
+		goto out_unlink;
+	}
+	if (xend() != 0) {
+		ksft_test_result_fail("mkdir publish through xend\n");
+		goto out_unlink;
+	}
+	ksft_test_result(access("/tmp/txos-mkdir-commit", F_OK) == 0,
+			 "mkdir publish through xend\n");
+
+	mkdir("/tmp/txos-rmdir-abort", 0700);
+	if (xbegin() != 0) {
+		ksft_test_result_fail("rmdir rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (rmdir("/tmp/txos-rmdir-abort") != 0) {
+		xabort();
+		ksft_test_result_fail("rmdir rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xabort() != 0) {
+		ksft_test_result_fail("rmdir rollback through xabort\n");
+		goto out_unlink;
+	}
+	ksft_test_result(access("/tmp/txos-rmdir-abort", F_OK) == 0,
+			 "rmdir rollback through xabort\n");
+
+	mkdir("/tmp/txos-rmdir-commit", 0700);
+	if (xbegin() != 0) {
+		ksft_test_result_fail("rmdir publish through xend\n");
+		goto out_unlink;
+	}
+	if (rmdir("/tmp/txos-rmdir-commit") != 0) {
+		xabort();
+		ksft_test_result_fail("rmdir publish through xend\n");
+		goto out_unlink;
+	}
+	if (xend() != 0) {
+		ksft_test_result_fail("rmdir publish through xend\n");
+		goto out_unlink;
+	}
+	ksft_test_result(access("/tmp/txos-rmdir-commit", F_OK) == -1 &&
+			 errno == ENOENT,
+			 "rmdir publish through xend\n");
 
 out_unlink:
 	unlink(path);

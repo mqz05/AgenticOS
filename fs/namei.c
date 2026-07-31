@@ -4457,6 +4457,12 @@ struct dentry *vfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (max_links && dir->i_nlink >= max_links)
 		goto err;
 
+	error = transaction_inode_snapshot(dir);
+	if (error)
+		goto err;
+	error = transaction_dentry_snapshot(dentry);
+	if (error)
+		goto err;
 	de = dir->i_op->mkdir(idmap, dir, dentry, mode);
 	error = PTR_ERR(de);
 	if (IS_ERR(de))
@@ -4552,6 +4558,17 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (error)
 		goto out;
 
+	error = transaction_inode_snapshot(dir);
+	if (error)
+		goto out;
+	error = transaction_inode_snapshot(dentry->d_inode);
+	if (error)
+		goto out;
+	if (current_transaction() && d_unhashed(dentry))
+		d_rehash_no_tx_snapshot(dentry);
+	error = transaction_dentry_snapshot_unlink(dentry);
+	if (error)
+		goto out;
 	error = dir->i_op->rmdir(dir, dentry);
 	if (error)
 		goto out;
@@ -4955,8 +4972,18 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
 		error = -EMLINK;
 	else {
 		error = try_break_deleg(inode, delegated_inode);
-		if (!error)
+		if (!error) {
+			error = transaction_inode_snapshot(dir);
+			if (error)
+				goto out_unlock;
+			error = transaction_inode_snapshot(inode);
+			if (error)
+				goto out_unlock;
+			error = transaction_dentry_snapshot(new_dentry);
+			if (error)
+				goto out_unlock;
 			error = dir->i_op->link(old_dentry, dir, new_dentry);
+		}
 	}
 
 	if (!error && (inode->i_state & I_LINKABLE)) {
@@ -4964,6 +4991,7 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
 		inode->i_state &= ~I_LINKABLE;
 		spin_unlock(&inode->i_lock);
 	}
+out_unlock:
 	inode_unlock(inode);
 	if (!error)
 		fsnotify_link(dir, inode, new_dentry);
