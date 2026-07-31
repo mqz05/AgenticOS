@@ -41,6 +41,10 @@ static int expect_syscall_error(long ret, int expected_errno)
 
 static void cleanup_namespace_fixtures(void)
 {
+	unlink("/tmp/txos-truncate-abort");
+	unlink("/tmp/txos-truncate-commit");
+	unlink("/tmp/txos-ftruncate-abort");
+	unlink("/tmp/txos-ftruncate-commit");
 	unlink("/tmp/txos-create-abort");
 	unlink("/tmp/txos-unlink-abort");
 	unlink("/tmp/txos-rename-old");
@@ -67,6 +71,33 @@ static int create_empty_file(const char *path, mode_t mode)
 	return close(fd);
 }
 
+static int create_file_with_data(const char *path, const char *data)
+{
+	ssize_t len = 0;
+	ssize_t written;
+	int fd;
+
+	while (data[len])
+		len++;
+
+	fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+
+	written = write(fd, data, len);
+	if (close(fd) != 0)
+		return -1;
+
+	return written == len ? 0 : -1;
+}
+
+static int file_size_is(const char *path, off_t size)
+{
+	struct stat st;
+
+	return stat(path, &st) == 0 && st.st_size == size;
+}
+
 int main(void)
 {
 	const char *path = "/tmp/txos-selftest-file";
@@ -74,7 +105,7 @@ int main(void)
 	int fd;
 
 	ksft_print_header();
-	ksft_set_plan(18);
+	ksft_set_plan(22);
 	cleanup_namespace_fixtures();
 
 	errno = 0;
@@ -119,6 +150,104 @@ int main(void)
 	}
 	ksft_test_result((st.st_mode & 0777) == 0600,
 			 "chmod rollback through xabort\n");
+
+	if (create_file_with_data("/tmp/txos-truncate-abort", "abcdef") != 0) {
+		ksft_test_result_fail("truncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xbegin() != 0) {
+		ksft_test_result_fail("truncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (truncate("/tmp/txos-truncate-abort", 2) != 0) {
+		xabort();
+		ksft_test_result_fail("truncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xabort() != 0) {
+		ksft_test_result_fail("truncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	ksft_test_result(file_size_is("/tmp/txos-truncate-abort", 6),
+			 "truncate size rollback through xabort\n");
+
+	if (create_file_with_data("/tmp/txos-truncate-commit", "abcdef") != 0) {
+		ksft_test_result_fail("truncate size publish through xend\n");
+		goto out_unlink;
+	}
+	if (xbegin() != 0) {
+		ksft_test_result_fail("truncate size publish through xend\n");
+		goto out_unlink;
+	}
+	if (truncate("/tmp/txos-truncate-commit", 2) != 0) {
+		xabort();
+		ksft_test_result_fail("truncate size publish through xend\n");
+		goto out_unlink;
+	}
+	if (xend() != 0) {
+		ksft_test_result_fail("truncate size publish through xend\n");
+		goto out_unlink;
+	}
+	ksft_test_result(file_size_is("/tmp/txos-truncate-commit", 2),
+			 "truncate size publish through xend\n");
+
+	if (create_file_with_data("/tmp/txos-ftruncate-abort", "abcdef") != 0) {
+		ksft_test_result_fail("ftruncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	fd = open("/tmp/txos-ftruncate-abort", O_RDWR);
+	if (fd < 0) {
+		ksft_test_result_fail("ftruncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xbegin() != 0) {
+		close(fd);
+		ksft_test_result_fail("ftruncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (ftruncate(fd, 2) != 0) {
+		xabort();
+		close(fd);
+		ksft_test_result_fail("ftruncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	if (xabort() != 0) {
+		close(fd);
+		ksft_test_result_fail("ftruncate size rollback through xabort\n");
+		goto out_unlink;
+	}
+	close(fd);
+	ksft_test_result(file_size_is("/tmp/txos-ftruncate-abort", 6),
+			 "ftruncate size rollback through xabort\n");
+
+	if (create_file_with_data("/tmp/txos-ftruncate-commit", "abcdef") != 0) {
+		ksft_test_result_fail("ftruncate size publish through xend\n");
+		goto out_unlink;
+	}
+	fd = open("/tmp/txos-ftruncate-commit", O_RDWR);
+	if (fd < 0) {
+		ksft_test_result_fail("ftruncate size publish through xend\n");
+		goto out_unlink;
+	}
+	if (xbegin() != 0) {
+		close(fd);
+		ksft_test_result_fail("ftruncate size publish through xend\n");
+		goto out_unlink;
+	}
+	if (ftruncate(fd, 2) != 0) {
+		xabort();
+		close(fd);
+		ksft_test_result_fail("ftruncate size publish through xend\n");
+		goto out_unlink;
+	}
+	if (xend() != 0) {
+		close(fd);
+		ksft_test_result_fail("ftruncate size publish through xend\n");
+		goto out_unlink;
+	}
+	close(fd);
+	ksft_test_result(file_size_is("/tmp/txos-ftruncate-commit", 2),
+			 "ftruncate size publish through xend\n");
 
 	if (xbegin() != 0) {
 		ksft_test_result_fail("create rollback through xabort\n");

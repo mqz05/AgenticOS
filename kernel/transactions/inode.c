@@ -8,6 +8,8 @@
 
 /* Per transaction snapshot of inode metadata. */
 struct transaction_inode_shadow {
+	loff_t i_size;
+	blkcnt_t i_blocks;
 	umode_t i_mode;
 	kuid_t i_uid;
 	kgid_t i_gid;
@@ -30,6 +32,8 @@ static int transaction_inode_abort(struct txobj_thread_list_node * node) {
 	struct transaction_inode_shadow * shadow = node->shadow_obj;
 	struct inode * inode = node->orig_obj;
  
+	i_size_write(inode, shadow->i_size);
+	inode->i_blocks = shadow->i_blocks;
 	inode->i_mode = shadow->i_mode;
 	inode->i_uid = shadow->i_uid;
 	inode->i_gid = shadow->i_gid;
@@ -84,6 +88,8 @@ int transaction_inode_snapshot(struct inode * inode) {
 	if (!shadow)
 		return -ENOMEM;
 
+	shadow->i_size = i_size_read(inode);
+	shadow->i_blocks = inode->i_blocks;
 	shadow->i_mode = inode->i_mode;
 	shadow->i_uid = inode->i_uid;
 	shadow->i_gid = inode->i_gid;
