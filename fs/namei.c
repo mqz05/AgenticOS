@@ -4685,7 +4685,7 @@ int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
 				goto out;
 			if (current_transaction() && d_unhashed(dentry))
 				d_rehash_no_tx_snapshot(dentry);
-			error = transaction_dentry_snapshot(dentry);
+			error = transaction_dentry_snapshot_unlink(dentry);
 			if (error)
 				goto out;
 			error = dir->i_op->unlink(dir, dentry);

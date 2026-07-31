@@ -17,6 +17,7 @@ struct transaction_dentry_shadow {
 	struct qstr d_name;
 	union shortname_store d_shortname;
 	bool external_name;
+	bool restore_unlink_pin;
 	struct tx_hlist_bl_node_snapshot d_hash;
 	struct tx_hlist_node_snapshot d_sib;
 	struct tx_hlist_node_snapshot d_alias;
@@ -58,6 +59,8 @@ static int transaction_dentry_abort(struct txobj_thread_list_node * node) {
 	tx_hlist_bl_restore(&dentry->d_hash, &shadow->d_hash);
 	tx_hlist_restore(&dentry->d_sib, &shadow->d_sib);
 	tx_hlist_restore(&dentry->d_u.d_alias, &shadow->d_alias);
+	if (shadow->restore_unlink_pin)
+		dget_dlock(dentry);
 
 	return 0;
 }
@@ -69,7 +72,8 @@ static int transaction_dentry_release(struct txobj_thread_list_node * node, int 
 	return 0;
 }
 
-static int __transaction_dentry_snapshot(struct dentry * dentry, bool locked) {
+static int __transaction_dentry_snapshot(struct dentry * dentry, bool locked,
+					 bool restore_unlink_pin) {
 	struct transaction_dentry_shadow *shadow;
 	struct txobj_thread_list_node *node;
 	struct transaction *transaction;
@@ -90,9 +94,15 @@ static int __transaction_dentry_snapshot(struct dentry * dentry, bool locked) {
 	if (status != TRANSACTION_ACTIVE)
 		return 0;
 
-	if (transaction_workset_find_object(transaction,
-					    &dentry->transaction_object))
+	node = transaction_workset_find_object(transaction,
+					       &dentry->transaction_object);
+	if (node) {
+		if (restore_unlink_pin) {
+			shadow = node->shadow_obj;
+			shadow->restore_unlink_pin = true;
+		}
 		return 0;
+	}
 
 	shadow = kmalloc(sizeof(*shadow), gfp);
 	if (!shadow)
@@ -105,6 +115,7 @@ static int __transaction_dentry_snapshot(struct dentry * dentry, bool locked) {
 	shadow->d_fsdata = dentry->d_fsdata;
 	shadow->d_inode = dentry->d_inode;
 	shadow->d_parent = dentry->d_parent;
+	shadow->restore_unlink_pin = restore_unlink_pin;
 	shadow->external_name = dentry->d_name.name != dentry->d_shortname.string;
 	if (!shadow->external_name) {
 		shadow->d_name = dentry->d_name;
@@ -159,11 +170,16 @@ free_node:
 }
 
 int transaction_dentry_snapshot(struct dentry * dentry) {
-	return __transaction_dentry_snapshot(dentry, false);
+	return __transaction_dentry_snapshot(dentry, false, false);
 }
 EXPORT_SYMBOL_GPL(transaction_dentry_snapshot);
 
 int transaction_dentry_snapshot_locked(struct dentry * dentry) {
-	return __transaction_dentry_snapshot(dentry, true);
+	return __transaction_dentry_snapshot(dentry, true, false);
 }
 EXPORT_SYMBOL_GPL(transaction_dentry_snapshot_locked);
+
+int transaction_dentry_snapshot_unlink(struct dentry * dentry) {
+	return __transaction_dentry_snapshot(dentry, false, true);
+}
+EXPORT_SYMBOL_GPL(transaction_dentry_snapshot_unlink);
