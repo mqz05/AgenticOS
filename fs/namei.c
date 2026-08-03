@@ -382,7 +382,7 @@ static inline bool no_acl_inode(struct inode *inode)
 static int acl_permission_check(struct mnt_idmap *idmap,
 				struct inode *inode, int mask)
 {
-	unsigned int mode = inode->i_mode;
+	unsigned int mode = inode_get_mode(inode);
 	vfsuid_t vfsuid;
 
 	/*
@@ -474,7 +474,7 @@ int generic_permission(struct mnt_idmap *idmap, struct inode *inode,
 	if (ret != -EACCES)
 		return ret;
 
-	if (S_ISDIR(inode->i_mode)) {
+	if (S_ISDIR(inode_get_mode(inode))) {
 		/* DACs are overridable for directories */
 		if (!(mask & MAY_WRITE))
 			if (capable_wrt_inode_uidgid(idmap, inode,
@@ -499,7 +499,7 @@ int generic_permission(struct mnt_idmap *idmap, struct inode *inode,
 	 * Executable DACs are overridable when there is
 	 * at least one exec bit set.
 	 */
-	if (!(mask & MAY_EXEC) || (inode->i_mode & S_IXUGO))
+	if (!(mask & MAY_EXEC) || (inode_get_mode(inode) & S_IXUGO))
 		if (capable_wrt_inode_uidgid(idmap, inode,
 					     CAP_DAC_OVERRIDE))
 			return 0;
@@ -545,7 +545,7 @@ static inline int do_inode_permission(struct mnt_idmap *idmap,
 static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
 {
 	if (unlikely(mask & MAY_WRITE)) {
-		umode_t mode = inode->i_mode;
+		umode_t mode = inode_get_mode(inode);
 
 		/* Nobody gets write access to a read-only fs. */
 		if (sb_rdonly(sb) && (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
@@ -570,6 +570,14 @@ int inode_permission(struct mnt_idmap *idmap,
 		     struct inode *inode, int mask)
 {
 	int retval;
+
+	if (current_transaction()) {
+		if (mask & MAY_NOT_BLOCK)
+			return -ECHILD;
+		retval = transaction_inode_read(inode);
+		if (retval)
+			return retval;
+	}
 
 	retval = sb_permission(inode->i_sb, inode, mask);
 	if (unlikely(retval))
@@ -1212,7 +1220,7 @@ static inline int may_follow_link(struct nameidata *nd, const struct inode *inod
 static bool safe_hardlink_source(struct mnt_idmap *idmap,
 				 struct inode *inode)
 {
-	umode_t mode = inode->i_mode;
+	umode_t mode = inode_get_mode(inode);
 
 	/* Special files should not get pinned to the filesystem. */
 	if (!S_ISREG(mode))
@@ -1311,10 +1319,10 @@ static int may_create_in_sticky(struct mnt_idmap *idmap, struct nameidata *nd,
 	if (likely(!(dir_mode & S_ISVTX)))
 		return 0;
 
-	if (S_ISREG(inode->i_mode) && !sysctl_protected_regular)
+	if (S_ISREG(inode_get_mode(inode)) && !sysctl_protected_regular)
 		return 0;
 
-	if (S_ISFIFO(inode->i_mode) && !sysctl_protected_fifos)
+	if (S_ISFIFO(inode_get_mode(inode)) && !sysctl_protected_fifos)
 		return 0;
 
 	i_vfsuid = i_uid_into_vfsuid(idmap, inode);
@@ -1331,13 +1339,13 @@ static int may_create_in_sticky(struct mnt_idmap *idmap, struct nameidata *nd,
 	}
 
 	if (dir_mode & 0020) {
-		if (sysctl_protected_fifos >= 2 && S_ISFIFO(inode->i_mode)) {
+		if (sysctl_protected_fifos >= 2 && S_ISFIFO(inode_get_mode(inode))) {
 			audit_log_path_denied(AUDIT_ANOM_CREAT,
 					      "sticky_create_fifo");
 			return -EACCES;
 		}
 
-		if (sysctl_protected_regular >= 2 && S_ISREG(inode->i_mode)) {
+		if (sysctl_protected_regular >= 2 && S_ISREG(inode_get_mode(inode))) {
 			audit_log_path_denied(AUDIT_ANOM_CREAT,
 					      "sticky_create_regular");
 			return -EACCES;
@@ -2508,7 +2516,7 @@ OK:
 			/* pathname or trailing symlink, done */
 			if (!depth) {
 				nd->dir_vfsuid = i_uid_into_vfsuid(idmap, nd->inode);
-				nd->dir_mode = nd->inode->i_mode;
+				nd->dir_mode = inode_get_mode(nd->inode);
 				nd->flags &= ~LOOKUP_PARENT;
 				return 0;
 			}
@@ -3541,7 +3549,7 @@ static int may_open(struct mnt_idmap *idmap, const struct path *path,
 	if (!inode)
 		return -ENOENT;
 
-	switch (inode->i_mode & S_IFMT) {
+	switch (inode_get_mode(inode) & S_IFMT) {
 	case S_IFLNK:
 		return -ELOOP;
 	case S_IFDIR:
@@ -4454,7 +4462,7 @@ struct dentry *vfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		goto err;
 
 	error = -EMLINK;
-	if (max_links && dir->i_nlink >= max_links)
+	if (max_links && inode_get_nlink(dir) >= max_links)
 		goto err;
 
 	error = transaction_inode_snapshot(dir);
@@ -4551,7 +4559,7 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	error = -EBUSY;
 	if (is_local_mountpoint(dentry) ||
-	    (dentry->d_inode->i_flags & S_KERNEL_FILE))
+	    (inode_get_flags(dentry->d_inode) & S_KERNEL_FILE))
 		goto out;
 
 	error = security_inode_rmdir(dir, dentry);
@@ -4574,7 +4582,7 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 		goto out;
 
 	shrink_dcache_parent(dentry);
-	dentry->d_inode->i_flags |= S_DEAD;
+	inode_set_flags(dentry->d_inode, S_DEAD, S_DEAD);
 	dont_mount(dentry);
 	detach_mounts(dentry);
 
@@ -4957,7 +4965,7 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
 		return -EPERM;
 	if (!dir->i_op->link)
 		return -EPERM;
-	if (S_ISDIR(inode->i_mode))
+	if (S_ISDIR(inode_get_mode(inode)))
 		return -EPERM;
 
 	error = security_inode_link(old_dentry, dir, new_dentry);
@@ -4966,9 +4974,9 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
 
 	inode_lock(inode);
 	/* Make sure we don't allow creating hardlink to an unlinked file */
-	if (inode->i_nlink == 0 && !(inode->i_state & I_LINKABLE))
+	if (inode_get_nlink(inode) == 0 && !(inode->i_state & I_LINKABLE))
 		error =  -ENOENT;
-	else if (max_links && inode->i_nlink >= max_links)
+	else if (max_links && inode_get_nlink(inode) >= max_links)
 		error = -EMLINK;
 	else {
 		error = try_break_deleg(inode, delegated_inode);
@@ -5243,10 +5251,10 @@ int vfs_rename(struct renamedata *rd)
 
 	if (max_links && new_dir != old_dir) {
 		error = -EMLINK;
-		if (is_dir && !new_is_dir && new_dir->i_nlink >= max_links)
+		if (is_dir && !new_is_dir && inode_get_nlink(new_dir) >= max_links)
 			goto out;
 		if ((flags & RENAME_EXCHANGE) && !is_dir && new_is_dir &&
-		    old_dir->i_nlink >= max_links)
+		    inode_get_nlink(old_dir) >= max_links)
 			goto out;
 	}
 	if (!is_dir) {
@@ -5293,7 +5301,7 @@ int vfs_rename(struct renamedata *rd)
 	if (!(flags & RENAME_EXCHANGE) && target) {
 		if (is_dir) {
 			shrink_dcache_parent(new_dentry);
-			target->i_flags |= S_DEAD;
+			inode_set_flags(target, S_DEAD, S_DEAD);
 		}
 		dont_mount(new_dentry);
 		detach_mounts(new_dentry);
@@ -5614,7 +5622,7 @@ const char *page_get_link(struct dentry *dentry, struct inode *inode,
 	char *kaddr = __page_get_link(dentry, inode, callback);
 
 	if (!IS_ERR(kaddr))
-		nd_terminate_link(kaddr, inode->i_size, PAGE_SIZE - 1);
+		nd_terminate_link(kaddr, i_size_read(inode), PAGE_SIZE - 1);
 	return kaddr;
 }
 EXPORT_SYMBOL(page_get_link);

@@ -786,6 +786,34 @@ enum inode_state_flags_t {
 #define I_DIRTY (I_DIRTY_INODE | I_DIRTY_PAGES)
 #define I_DIRTY_ALL (I_DIRTY | I_DIRTY_TIME)
 
+struct inode;
+
+#ifdef CONFIG_TRANSACTIONS
+/* Transactionally mutable inode contents. The stable struct inode keeps
+ * identity, native synchronization, and filesystem-private state. */
+struct _inode {
+	struct inode *parent;
+	/* NULL when committed; otherwise points to the committed contents. */
+	struct _inode *shadow;
+	refcount_t tx_refcount;
+	struct rcu_head i_rcu;
+	bool embedded;
+	umode_t i_mode;
+	kuid_t i_uid;
+	kgid_t i_gid;
+	unsigned int i_flags;
+	unsigned int i_nlink;
+	loff_t i_size;
+	atomic64_t i_version;
+	time64_t i_atime_sec;
+	time64_t i_mtime_sec;
+	time64_t i_ctime_sec;
+	u32 i_atime_nsec;
+	u32 i_mtime_nsec;
+	u32 i_ctime_nsec;
+};
+#endif
+
 /*
  * Keep mostly read-only and often accessed (especially for
  * the RCU path lookup and 'stat' data) fields at the beginning
@@ -798,6 +826,8 @@ struct inode {
 	kgid_t			i_gid;
 #ifdef CONFIG_TRANSACTIONS
 	struct transaction_object transaction_object;
+	struct _inode __rcu *i_contents;
+	struct _inode i_committed;
 #endif
 	unsigned int		i_flags;
 
@@ -1080,7 +1110,7 @@ void filemap_invalidate_unlock_two(struct address_space *mapping1,
  * cmpxchg8b without the need of the lock prefix). For SMP compiles
  * and 64bit archs it makes no difference if preempt is enabled or not.
  */
-static inline loff_t i_size_read(const struct inode *inode)
+static inline loff_t __i_size_read(const struct inode *inode)
 {
 #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
 	loff_t i_size;
@@ -1104,12 +1134,23 @@ static inline loff_t i_size_read(const struct inode *inode)
 #endif
 }
 
+static inline loff_t i_size_read(const struct inode *inode)
+{
+#ifdef CONFIG_TRANSACTIONS
+	loff_t i_size;
+
+	if (transaction_inode_get_size(inode, &i_size))
+		return i_size;
+#endif
+	return __i_size_read(inode);
+}
+
 /*
  * NOTE: unlike i_size_read(), i_size_write() does need locking around it
  * (normally i_rwsem), otherwise on 32bit/SMP an update of i_size_seqcount
  * can be lost, resulting in subsequent i_size_read() calls spinning forever.
  */
-static inline void i_size_write(struct inode *inode, loff_t i_size)
+static inline void __i_size_write(struct inode *inode, loff_t i_size)
 {
 #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
 	preempt_disable();
@@ -1129,6 +1170,15 @@ static inline void i_size_write(struct inode *inode, loff_t i_size)
 	 */
 	smp_store_release(&inode->i_size, i_size);
 #endif
+}
+
+static inline void i_size_write(struct inode *inode, loff_t i_size)
+{
+#ifdef CONFIG_TRANSACTIONS
+	if (transaction_inode_set_size(inode, i_size))
+		return;
+#endif
+	__i_size_write(inode, i_size);
 }
 
 static inline unsigned iminor(const struct inode *inode)
@@ -1600,6 +1650,56 @@ static inline struct user_namespace *i_user_ns(const struct inode *inode)
 	return inode->i_sb->s_user_ns;
 }
 
+static inline kuid_t inode_get_uid(const struct inode *inode)
+{
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_uid;
+#endif
+	return inode->i_uid;
+}
+
+static inline kgid_t inode_get_gid(const struct inode *inode)
+{
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_gid;
+#endif
+	return inode->i_gid;
+}
+
+static inline void inode_set_uid(struct inode *inode, kuid_t uid)
+{
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode))
+			shadow_inode->i_uid = uid;
+		return;
+	}
+#endif
+	inode->i_uid = uid;
+}
+
+static inline void inode_set_gid(struct inode *inode, kgid_t gid)
+{
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode))
+			shadow_inode->i_gid = gid;
+		return;
+	}
+#endif
+	inode->i_gid = gid;
+}
+
 /* Helper functions so that in most cases filesystems will
  * not need to deal directly with kuid_t and kgid_t and can
  * instead deal with the raw numeric values that are stored
@@ -1607,22 +1707,22 @@ static inline struct user_namespace *i_user_ns(const struct inode *inode)
  */
 static inline uid_t i_uid_read(const struct inode *inode)
 {
-	return from_kuid(i_user_ns(inode), inode->i_uid);
+	return from_kuid(i_user_ns(inode), inode_get_uid(inode));
 }
 
 static inline gid_t i_gid_read(const struct inode *inode)
 {
-	return from_kgid(i_user_ns(inode), inode->i_gid);
+	return from_kgid(i_user_ns(inode), inode_get_gid(inode));
 }
 
 static inline void i_uid_write(struct inode *inode, uid_t uid)
 {
-	inode->i_uid = make_kuid(i_user_ns(inode), uid);
+	inode_set_uid(inode, make_kuid(i_user_ns(inode), uid));
 }
 
 static inline void i_gid_write(struct inode *inode, gid_t gid)
 {
-	inode->i_gid = make_kgid(i_user_ns(inode), gid);
+	inode_set_gid(inode, make_kgid(i_user_ns(inode), gid));
 }
 
 /**
@@ -1636,7 +1736,7 @@ static inline void i_gid_write(struct inode *inode, gid_t gid)
 static inline vfsuid_t i_uid_into_vfsuid(struct mnt_idmap *idmap,
 					 const struct inode *inode)
 {
-	return make_vfsuid(idmap, i_user_ns(inode), inode->i_uid);
+	return make_vfsuid(idmap, i_user_ns(inode), inode_get_uid(inode));
 }
 
 /**
@@ -1673,8 +1773,8 @@ static inline void i_uid_update(struct mnt_idmap *idmap,
 				struct inode *inode)
 {
 	if (attr->ia_valid & ATTR_UID)
-		inode->i_uid = from_vfsuid(idmap, i_user_ns(inode),
-					   attr->ia_vfsuid);
+		inode_set_uid(inode, from_vfsuid(idmap, i_user_ns(inode),
+						 attr->ia_vfsuid));
 }
 
 /**
@@ -1688,7 +1788,7 @@ static inline void i_uid_update(struct mnt_idmap *idmap,
 static inline vfsgid_t i_gid_into_vfsgid(struct mnt_idmap *idmap,
 					 const struct inode *inode)
 {
-	return make_vfsgid(idmap, i_user_ns(inode), inode->i_gid);
+	return make_vfsgid(idmap, i_user_ns(inode), inode_get_gid(inode));
 }
 
 /**
@@ -1725,8 +1825,8 @@ static inline void i_gid_update(struct mnt_idmap *idmap,
 				struct inode *inode)
 {
 	if (attr->ia_valid & ATTR_GID)
-		inode->i_gid = from_vfsgid(idmap, i_user_ns(inode),
-					   attr->ia_vfsgid);
+		inode_set_gid(inode, from_vfsgid(idmap, i_user_ns(inode),
+						 attr->ia_vfsgid));
 }
 
 /**
@@ -1740,7 +1840,7 @@ static inline void i_gid_update(struct mnt_idmap *idmap,
 static inline void inode_fsuid_set(struct inode *inode,
 				   struct mnt_idmap *idmap)
 {
-	inode->i_uid = mapped_fsuid(idmap, i_user_ns(inode));
+	inode_set_uid(inode, mapped_fsuid(idmap, i_user_ns(inode)));
 }
 
 /**
@@ -1754,7 +1854,7 @@ static inline void inode_fsuid_set(struct inode *inode,
 static inline void inode_fsgid_set(struct inode *inode,
 				   struct mnt_idmap *idmap)
 {
-	inode->i_gid = mapped_fsgid(idmap, i_user_ns(inode));
+	inode_set_gid(inode, mapped_fsgid(idmap, i_user_ns(inode)));
 }
 
 /**
@@ -1792,11 +1892,23 @@ struct timespec64 inode_set_ctime_deleg(struct inode *inode,
 
 static inline time64_t inode_get_atime_sec(const struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_atime_sec;
+#endif
 	return inode->i_atime_sec;
 }
 
 static inline long inode_get_atime_nsec(const struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_atime_nsec;
+#endif
 	return inode->i_atime_nsec;
 }
 
@@ -1811,6 +1923,17 @@ static inline struct timespec64 inode_get_atime(const struct inode *inode)
 static inline struct timespec64 inode_set_atime_to_ts(struct inode *inode,
 						      struct timespec64 ts)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			shadow_inode->i_atime_sec = ts.tv_sec;
+			shadow_inode->i_atime_nsec = ts.tv_nsec;
+		}
+		return ts;
+	}
+#endif
 	inode->i_atime_sec = ts.tv_sec;
 	inode->i_atime_nsec = ts.tv_nsec;
 	return ts;
@@ -1827,11 +1950,23 @@ static inline struct timespec64 inode_set_atime(struct inode *inode,
 
 static inline time64_t inode_get_mtime_sec(const struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_mtime_sec;
+#endif
 	return inode->i_mtime_sec;
 }
 
 static inline long inode_get_mtime_nsec(const struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_mtime_nsec;
+#endif
 	return inode->i_mtime_nsec;
 }
 
@@ -1845,6 +1980,17 @@ static inline struct timespec64 inode_get_mtime(const struct inode *inode)
 static inline struct timespec64 inode_set_mtime_to_ts(struct inode *inode,
 						      struct timespec64 ts)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			shadow_inode->i_mtime_sec = ts.tv_sec;
+			shadow_inode->i_mtime_nsec = ts.tv_nsec;
+		}
+		return ts;
+	}
+#endif
 	inode->i_mtime_sec = ts.tv_sec;
 	inode->i_mtime_nsec = ts.tv_nsec;
 	return ts;
@@ -1871,11 +2017,23 @@ static inline struct timespec64 inode_set_mtime(struct inode *inode,
 
 static inline time64_t inode_get_ctime_sec(const struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_ctime_sec;
+#endif
 	return inode->i_ctime_sec;
 }
 
 static inline long inode_get_ctime_nsec(const struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_ctime_nsec & ~I_CTIME_QUERIED;
+#endif
 	return inode->i_ctime_nsec & ~I_CTIME_QUERIED;
 }
 
@@ -2551,19 +2709,37 @@ struct super_operations {
  */
 #define __IS_FLG(inode, flg)	((inode)->i_sb->s_flags & (flg))
 
+static inline unsigned int inode_get_flags(const struct inode *inode) {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_flags;
+#endif
+	return inode->i_flags;
+}
+
+static inline umode_t inode_get_mode(const struct inode *inode) {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_mode;
+#endif
+	return inode->i_mode;
+}
+
 static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags & SB_RDONLY; }
 #define IS_RDONLY(inode)	sb_rdonly((inode)->i_sb)
-#define IS_SYNC(inode)		(__IS_FLG(inode, SB_SYNCHRONOUS) || \
-					((inode)->i_flags & S_SYNC))
-#define IS_DIRSYNC(inode)	(__IS_FLG(inode, SB_SYNCHRONOUS|SB_DIRSYNC) || \
-					((inode)->i_flags & (S_SYNC|S_DIRSYNC)))
+#define IS_SYNC(inode)		(__IS_FLG(inode, SB_SYNCHRONOUS) || (inode_get_flags(inode) & S_SYNC))
+#define IS_DIRSYNC(inode)	(__IS_FLG(inode, SB_SYNCHRONOUS|SB_DIRSYNC) || (inode_get_flags(inode) & (S_SYNC|S_DIRSYNC)))
 #define IS_MANDLOCK(inode)	__IS_FLG(inode, SB_MANDLOCK)
 #define IS_NOATIME(inode)	__IS_FLG(inode, SB_RDONLY|SB_NOATIME)
 #define IS_I_VERSION(inode)	__IS_FLG(inode, SB_I_VERSION)
 
-#define IS_NOQUOTA(inode)	((inode)->i_flags & S_NOQUOTA)
-#define IS_APPEND(inode)	((inode)->i_flags & S_APPEND)
-#define IS_IMMUTABLE(inode)	((inode)->i_flags & S_IMMUTABLE)
+#define IS_NOQUOTA(inode)	(inode_get_flags(inode) & S_NOQUOTA)
+#define IS_APPEND(inode)	(inode_get_flags(inode) & S_APPEND)
+#define IS_IMMUTABLE(inode)	(inode_get_flags(inode) & S_IMMUTABLE)
 
 #ifdef CONFIG_FS_POSIX_ACL
 #define IS_POSIXACL(inode)	__IS_FLG(inode, SB_POSIXACL)
@@ -2571,27 +2747,26 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags 
 #define IS_POSIXACL(inode)	0
 #endif
 
-#define IS_DEADDIR(inode)	((inode)->i_flags & S_DEAD)
-#define IS_NOCMTIME(inode)	((inode)->i_flags & S_NOCMTIME)
+#define IS_DEADDIR(inode)	(inode_get_flags(inode) & S_DEAD)
+#define IS_NOCMTIME(inode)	(inode_get_flags(inode) & S_NOCMTIME)
 
 #ifdef CONFIG_SWAP
-#define IS_SWAPFILE(inode)	((inode)->i_flags & S_SWAPFILE)
+#define IS_SWAPFILE(inode)	(inode_get_flags(inode) & S_SWAPFILE)
 #else
 #define IS_SWAPFILE(inode)	((void)(inode), 0U)
 #endif
 
-#define IS_PRIVATE(inode)	((inode)->i_flags & S_PRIVATE)
-#define IS_IMA(inode)		((inode)->i_flags & S_IMA)
-#define IS_AUTOMOUNT(inode)	((inode)->i_flags & S_AUTOMOUNT)
-#define IS_NOSEC(inode)		((inode)->i_flags & S_NOSEC)
-#define IS_DAX(inode)		((inode)->i_flags & S_DAX)
-#define IS_ENCRYPTED(inode)	((inode)->i_flags & S_ENCRYPTED)
-#define IS_CASEFOLDED(inode)	((inode)->i_flags & S_CASEFOLD)
-#define IS_VERITY(inode)	((inode)->i_flags & S_VERITY)
+#define IS_PRIVATE(inode)	(inode_get_flags(inode) & S_PRIVATE)
+#define IS_IMA(inode)		(inode_get_flags(inode) & S_IMA)
+#define IS_AUTOMOUNT(inode)	(inode_get_flags(inode) & S_AUTOMOUNT)
+#define IS_NOSEC(inode)		(inode_get_flags(inode) & S_NOSEC)
+#define IS_DAX(inode)		(inode_get_flags(inode) & S_DAX)
+#define IS_ENCRYPTED(inode)	(inode_get_flags(inode) & S_ENCRYPTED)
+#define IS_CASEFOLDED(inode)	(inode_get_flags(inode) & S_CASEFOLD)
+#define IS_VERITY(inode)	(inode_get_flags(inode) & S_VERITY)
 
-#define IS_WHITEOUT(inode)	(S_ISCHR(inode->i_mode) && \
-				 (inode)->i_rdev == WHITEOUT_DEV)
-#define IS_ANON_FILE(inode)	((inode)->i_flags & S_ANON_INODE)
+#define IS_WHITEOUT(inode)	(S_ISCHR(inode_get_mode(inode)) && (inode)->i_rdev == WHITEOUT_DEV)
+#define IS_ANON_FILE(inode)	(inode_get_flags(inode) & S_ANON_INODE)
 
 static inline bool HAS_UNMAPPED_ID(struct mnt_idmap *idmap,
 				   struct inode *inode)
@@ -2655,6 +2830,16 @@ extern void inc_nlink(struct inode *inode);
 extern void drop_nlink(struct inode *inode);
 extern void clear_nlink(struct inode *inode);
 extern void set_nlink(struct inode *inode, unsigned int nlink);
+
+static inline unsigned int inode_get_nlink(const struct inode *inode) {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return contents->i_nlink;
+#endif
+	return inode->i_nlink;
+}
 
 static inline void inode_inc_link_count(struct inode *inode)
 {
@@ -3103,7 +3288,9 @@ int __check_sticky(struct mnt_idmap *idmap, struct inode *dir,
 
 static inline bool execute_ok(struct inode *inode)
 {
-	return (inode->i_mode & S_IXUGO) || S_ISDIR(inode->i_mode);
+	umode_t mode = inode_get_mode(inode);
+
+	return (mode & S_IXUGO) || S_ISDIR(mode);
 }
 
 static inline bool inode_wrong_type(const struct inode *inode, umode_t mode)
@@ -3976,7 +4163,7 @@ static inline bool is_sxid(umode_t mode)
 static inline int check_sticky(struct mnt_idmap *idmap,
 			       struct inode *dir, struct inode *inode)
 {
-	if (!(dir->i_mode & S_ISVTX))
+	if (!(inode_get_mode(dir) & S_ISVTX))
 		return 0;
 
 	return __check_sticky(idmap, dir, inode);
@@ -3984,8 +4171,8 @@ static inline int check_sticky(struct mnt_idmap *idmap,
 
 static inline void inode_has_no_xattr(struct inode *inode)
 {
-	if (!is_sxid(inode->i_mode) && (inode->i_sb->s_flags & SB_NOSEC))
-		inode->i_flags |= S_NOSEC;
+	if (!is_sxid(inode_get_mode(inode)) && (inode->i_sb->s_flags & SB_NOSEC))
+		inode_set_flags(inode, S_NOSEC, S_NOSEC);
 }
 
 static inline bool is_root_inode(struct inode *inode)

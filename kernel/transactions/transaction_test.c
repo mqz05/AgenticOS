@@ -6,6 +6,7 @@
 #include <linux/errno.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/iversion.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/transaction.h>
@@ -1315,6 +1316,7 @@ static void transaction_file_offset_commit_test(struct kunit *test) {
 }
 
 static void transaction_inode_metadata_abort_test(struct kunit *test) {
+	struct _inode *shadow_inode;
 	struct transaction *transaction;
 	struct inode *inode;
 	struct file *file;
@@ -1330,23 +1332,49 @@ static void transaction_inode_metadata_abort_test(struct kunit *test) {
 	inode_set_atime(inode, 1, 2);
 	inode_set_mtime(inode, 3, 4);
 	inode_set_ctime(inode, 5, 6);
+	inode_set_iversion(inode, 5);
 
 	transaction = transaction_alloc(GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, transaction);
 	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	shadow_inode = transaction_inode_visible(inode);
+	KUNIT_ASSERT_NOT_NULL(test, shadow_inode);
+	KUNIT_EXPECT_PTR_NE(test, shadow_inode, rcu_access_pointer(inode->i_contents));
+	KUNIT_EXPECT_PTR_EQ(test, shadow_inode->shadow, rcu_access_pointer(inode->i_contents));
 	KUNIT_EXPECT_PTR_EQ(test, inode->transaction_object.writer, transaction);
 	KUNIT_EXPECT_FALSE(test, list_empty(&inode->transaction_object.readers));
-	inode->i_mode = S_IFREG | 0644;
+	shadow_inode->i_mode = S_IFREG | 0644;
 	i_uid_write(inode, 2000);
 	i_gid_write(inode, 2000);
+	set_nlink(inode, 3);
+	i_size_write(inode, 42);
+	inode_set_flags(inode, S_DEAD, S_DEAD);
 	inode_set_atime(inode, 7, 8);
 	inode_set_mtime(inode, 9, 10);
 	inode_set_ctime(inode, 11, 12);
+	inode_inc_iversion(inode);
+	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0600);
+	KUNIT_EXPECT_EQ(test, inode->i_nlink, 1U);
+	KUNIT_EXPECT_EQ(test, inode_get_nlink(inode), 3U);
+	KUNIT_EXPECT_EQ(test, inode->i_size, 0LL);
+	KUNIT_EXPECT_EQ(test, i_size_read(inode), 42LL);
+	KUNIT_EXPECT_EQ(test, inode->i_flags & S_DEAD, 0U);
+	KUNIT_EXPECT_EQ(test, inode_get_flags(inode) & S_DEAD, S_DEAD);
+	KUNIT_EXPECT_EQ(test, i_uid_read(inode), 2000U);
+	KUNIT_EXPECT_EQ(test, i_gid_read(inode), 2000U);
+	KUNIT_EXPECT_EQ(test, inode_get_atime_sec(inode), 7LL);
+	KUNIT_EXPECT_EQ(test, inode_get_mtime_sec(inode), 9LL);
+	KUNIT_EXPECT_EQ(test, inode_get_ctime_sec(inode), 11LL);
+	KUNIT_EXPECT_EQ(test, inode_peek_iversion_raw(inode), 12ULL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&inode->i_version), 10LL);
 	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
 	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0600);
+	KUNIT_EXPECT_EQ(test, inode->i_nlink, 1U);
+	KUNIT_EXPECT_EQ(test, inode->i_size, 0LL);
+	KUNIT_EXPECT_EQ(test, inode->i_flags & S_DEAD, 0U);
 	KUNIT_EXPECT_EQ(test, i_uid_read(inode), 1000U);
 	KUNIT_EXPECT_EQ(test, i_gid_read(inode), 1000U);
 	KUNIT_EXPECT_EQ(test, inode_get_atime_sec(inode), 1LL);
@@ -1355,6 +1383,7 @@ static void transaction_inode_metadata_abort_test(struct kunit *test) {
 	KUNIT_EXPECT_EQ(test, inode_get_mtime_nsec(inode), 4L);
 	KUNIT_EXPECT_EQ(test, inode_get_ctime_sec(inode), 5LL);
 	KUNIT_EXPECT_EQ(test, inode_get_ctime_nsec(inode), 6L);
+	KUNIT_EXPECT_EQ(test, inode_peek_iversion_raw(inode), 10ULL);
 	KUNIT_EXPECT_PTR_EQ(test, inode->transaction_object.writer, NULL);
 	KUNIT_EXPECT_TRUE(test, list_empty(&inode->transaction_object.readers));
 	transaction_detach_task(current);
@@ -1363,6 +1392,51 @@ static void transaction_inode_metadata_abort_test(struct kunit *test) {
 }
 
 static void transaction_inode_metadata_commit_test(struct kunit *test) {
+	struct _inode *shadow_inode;
+	struct transaction *transaction;
+	struct inode *inode;
+	struct file *file;
+
+	file = anon_inode_create_getfile("[transaction-inode-test]",
+					 &transaction_test_file_operations,
+					 NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode->i_mode = S_IFREG | 0600;
+	inode_set_iversion(inode, 5);
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	shadow_inode = transaction_inode_visible(inode);
+	KUNIT_ASSERT_NOT_NULL(test, shadow_inode);
+	KUNIT_EXPECT_PTR_EQ(test, shadow_inode->shadow, rcu_access_pointer(inode->i_contents));
+	KUNIT_EXPECT_PTR_EQ(test, inode->transaction_object.writer, transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&inode->transaction_object.readers));
+	shadow_inode->i_mode = S_IFREG | 0644;
+	set_nlink(inode, 3);
+	i_size_write(inode, 42);
+	inode_set_flags(inode, S_DEAD, S_DEAD);
+	inode_inc_iversion(inode);
+	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0600);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0644);
+	KUNIT_EXPECT_EQ(test, inode->i_nlink, 3U);
+	KUNIT_EXPECT_EQ(test, inode->i_size, 42LL);
+	KUNIT_EXPECT_EQ(test, inode->i_flags & S_DEAD, S_DEAD);
+	KUNIT_EXPECT_EQ(test, inode_peek_iversion_raw(inode), 12ULL);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(inode->i_contents), shadow_inode);
+	KUNIT_EXPECT_PTR_EQ(test, shadow_inode->shadow, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, inode->transaction_object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&inode->transaction_object.readers));
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_inode_read_version_test(struct kunit *test) {
+	struct _inode *contents;
 	struct transaction *transaction;
 	struct inode *inode;
 	struct file *file;
@@ -1377,16 +1451,55 @@ static void transaction_inode_metadata_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_NOT_NULL(test, transaction);
 	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
-	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
-	KUNIT_EXPECT_PTR_EQ(test, inode->transaction_object.writer, transaction);
-	KUNIT_EXPECT_FALSE(test, list_empty(&inode->transaction_object.readers));
-	inode->i_mode = S_IFREG | 0644;
-	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
-	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0644);
+	contents = transaction_inode_get(inode, TRANSACTION_ACCESS_READ);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, contents);
+	KUNIT_EXPECT_PTR_EQ(test, contents, rcu_access_pointer(inode->i_contents));
+	KUNIT_EXPECT_PTR_EQ(test, contents->shadow, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, transaction_inode_visible(inode), contents);
 	KUNIT_EXPECT_PTR_EQ(test, inode->transaction_object.writer, NULL);
+	KUNIT_EXPECT_FALSE(test, list_empty(&inode->transaction_object.readers));
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
 	KUNIT_EXPECT_TRUE(test, list_empty(&inode->transaction_object.readers));
 	transaction_detach_task(current);
 	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_inode_refresh_committed_test(struct kunit *test) {
+	struct _inode *shadow_inode;
+	struct transaction *transaction;
+	struct inode *inode;
+	struct file *file;
+
+	file = anon_inode_create_getfile("[transaction-inode-test]",
+					 &transaction_test_file_operations,
+					 NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode->i_mode = S_IFREG | 0600;
+	i_uid_write(inode, 1000);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	shadow_inode = transaction_inode_visible(inode);
+	KUNIT_ASSERT_NOT_NULL(test, shadow_inode);
+	shadow_inode->i_mode = S_IFREG | 0644;
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+
+	/* Ordinary updates after a commit become the next committed baseline. */
+	inode->i_mode = S_IFREG | 0600;
+	i_uid_write(inode, 2000);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	shadow_inode = transaction_inode_visible(inode);
+	KUNIT_ASSERT_NOT_NULL(test, shadow_inode);
+	KUNIT_EXPECT_EQ(test, shadow_inode->i_mode, S_IFREG | 0600);
+	KUNIT_EXPECT_EQ(test, from_kuid(i_user_ns(inode), shadow_inode->i_uid), 2000U);
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_EQ(test, inode->i_mode, S_IFREG | 0600);
+	KUNIT_EXPECT_EQ(test, i_uid_read(inode), 2000U);
 	fput(file);
 }
 
@@ -1676,6 +1789,8 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_file_offset_commit_test),
 	KUNIT_CASE(transaction_inode_metadata_abort_test),
 	KUNIT_CASE(transaction_inode_metadata_commit_test),
+	KUNIT_CASE(transaction_inode_read_version_test),
+	KUNIT_CASE(transaction_inode_refresh_committed_test),
 	KUNIT_CASE(transaction_dentry_metadata_abort_test),
 	KUNIT_CASE(transaction_dentry_metadata_commit_test),
 	KUNIT_CASE(transaction_hlist_restore_test),

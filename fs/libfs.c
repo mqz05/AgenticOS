@@ -205,7 +205,7 @@ int dcache_readdir(struct file *file, struct dir_context *ctx)
 	while ((next = scan_positives(cursor, p, 1, next)) != NULL) {
 		if (!dir_emit(ctx, next->d_name.name, next->d_name.len,
 			      d_inode(next)->i_ino,
-			      fs_umode_to_dtype(d_inode(next)->i_mode)))
+			      fs_umode_to_dtype(inode_get_mode(d_inode(next)))))
 			break;
 		ctx->pos++;
 		p = &next->d_sib.next;
@@ -497,7 +497,7 @@ static bool offset_dir_emit(struct dir_context *ctx, struct dentry *dentry)
 	struct inode *inode = d_inode(dentry);
 
 	return dir_emit(ctx, dentry->d_name.name, dentry->d_name.len,
-			inode->i_ino, fs_umode_to_dtype(inode->i_mode));
+			inode->i_ino, fs_umode_to_dtype(inode_get_mode(inode)));
 }
 
 static void offset_iterate_dir(struct file *file, struct dir_context *ctx)
@@ -605,7 +605,7 @@ static void __simple_recursive_removal(struct dentry *dentry,
 
 		inode_lock_nested(inode, I_MUTEX_CHILD);
 		if (d_is_dir(this))
-			inode->i_flags |= S_DEAD;
+			inode_set_flags(inode, S_DEAD, S_DEAD);
 		while ((child = find_next_child(this, victim)) == NULL) {
 			// kill and ascend
 			// update metadata while it's still locked
@@ -1998,8 +1998,11 @@ EXPORT_SYMBOL(generic_set_sb_d_ops);
  */
 bool inode_maybe_inc_iversion(struct inode *inode, bool force)
 {
+	atomic64_t *counter = inode_iversion_write_counter(inode);
 	u64 cur, new;
 
+	if (!counter)
+		return false;
 	/*
 	 * The i_version field is not strictly ordered with any other inode
 	 * information, but the legacy inode_inc_iversion code used a spinlock
@@ -2025,7 +2028,7 @@ bool inode_maybe_inc_iversion(struct inode *inode, bool force)
 
 		/* Since lowest bit is flag, add 2 to avoid it */
 		new = (cur & ~I_VERSION_QUERIED) + I_VERSION_INCREMENT;
-	} while (!atomic64_try_cmpxchg(&inode->i_version, &cur, new));
+	} while (!atomic64_try_cmpxchg(counter, &cur, new));
 	return true;
 }
 EXPORT_SYMBOL(inode_maybe_inc_iversion);
@@ -2045,6 +2048,7 @@ EXPORT_SYMBOL(inode_maybe_inc_iversion);
  */
 u64 inode_query_iversion(struct inode *inode)
 {
+	atomic64_t *counter = inode_iversion_read_counter(inode);
 	u64 cur, new;
 	bool fenced = false;
 
@@ -2063,7 +2067,11 @@ u64 inode_query_iversion(struct inode *inode)
 
 		fenced = true;
 		new = cur | I_VERSION_QUERIED;
-	} while (!atomic64_try_cmpxchg(&inode->i_version, &cur, new));
+	} while (!atomic64_try_cmpxchg(counter, &cur, new));
+#ifdef CONFIG_TRANSACTIONS
+	if (counter != &inode->i_version)
+		atomic64_or(I_VERSION_QUERIED, &inode->i_version);
+#endif
 	return cur >> I_VERSION_QUERIED_SHIFT;
 }
 EXPORT_SYMBOL(inode_query_iversion);

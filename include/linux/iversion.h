@@ -96,6 +96,26 @@
 #define I_VERSION_QUERIED	(1ULL << (I_VERSION_QUERIED_SHIFT - 1))
 #define I_VERSION_INCREMENT	(1ULL << I_VERSION_QUERIED_SHIFT)
 
+static inline atomic64_t *inode_iversion_read_counter(const struct inode *inode) {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible((struct inode *)inode);
+
+	if (contents)
+		return &contents->i_version;
+#endif
+	return (atomic64_t *)&inode->i_version;
+}
+
+static inline atomic64_t *inode_iversion_write_counter(struct inode *inode) {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode)
+		return IS_ERR(shadow_inode) ? NULL : &shadow_inode->i_version;
+#endif
+	return &inode->i_version;
+}
+
 /**
  * inode_set_iversion_raw - set i_version to the specified raw value
  * @inode: inode to set
@@ -110,7 +130,10 @@
 static inline void
 inode_set_iversion_raw(struct inode *inode, u64 val)
 {
-	atomic64_set(&inode->i_version, val);
+	atomic64_t *counter = inode_iversion_write_counter(inode);
+
+	if (counter)
+		atomic64_set(counter, val);
 }
 
 /**
@@ -127,7 +150,7 @@ inode_set_iversion_raw(struct inode *inode, u64 val)
 static inline u64
 inode_peek_iversion_raw(const struct inode *inode)
 {
-	return atomic64_read(&inode->i_version);
+	return atomic64_read(inode_iversion_read_counter(inode));
 }
 
 /**
@@ -141,12 +164,15 @@ inode_peek_iversion_raw(const struct inode *inode)
 static inline void
 inode_set_max_iversion_raw(struct inode *inode, u64 val)
 {
+	atomic64_t *counter = inode_iversion_write_counter(inode);
 	u64 cur = inode_peek_iversion_raw(inode);
 
+	if (!counter)
+		return;
 	do {
 		if (cur > val)
 			break;
-	} while (!atomic64_try_cmpxchg(&inode->i_version, &cur, val));
+	} while (!atomic64_try_cmpxchg(counter, &cur, val));
 }
 
 /**
@@ -232,7 +258,10 @@ inode_iversion_need_inc(struct inode *inode)
 static inline void
 inode_inc_iversion_raw(struct inode *inode)
 {
-	atomic64_inc(&inode->i_version);
+	atomic64_t *counter = inode_iversion_write_counter(inode);
+
+	if (counter)
+		atomic64_inc(counter);
 }
 
 /**

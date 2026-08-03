@@ -17,7 +17,10 @@
 struct task_struct;
 struct file;
 struct inode;
+struct _inode;
 struct dentry;
+struct iattr;
+struct mnt_idmap;
 struct transaction;
 
 #ifdef CONFIG_TRANSACTIONS
@@ -181,6 +184,14 @@ loff_t transaction_file_get_pos(struct file *file);
 int transaction_file_snapshot(struct file *file);
 int transaction_file_set_pos(struct file *file, loff_t pos);
 void transaction_inode_init(struct inode *inode);
+void transaction_inode_destroy(struct inode *inode);
+struct _inode *transaction_inode_get(struct inode *inode, enum transaction_access_mode mode);
+struct _inode *transaction_inode_visible(struct inode *inode);
+struct _inode *transaction_inode_shadow(struct inode *inode);
+bool transaction_inode_get_size(const struct inode *inode, loff_t *size);
+bool transaction_inode_set_size(struct inode *inode, loff_t size);
+bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode, const struct iattr *attr);
+int transaction_inode_read(struct inode *inode);
 int transaction_inode_snapshot(struct inode *inode);
 void transaction_dentry_init(struct dentry *dentry);
 int transaction_dentry_snapshot(struct dentry *dentry);
@@ -226,6 +237,23 @@ static inline int transaction_file_snapshot(struct file *file) {
 	return 0;
 }
 static inline void transaction_inode_init(struct inode *inode) { }
+static inline void transaction_inode_destroy(struct inode *inode) { }
+static inline struct _inode *transaction_inode_shadow(struct inode *inode) {
+	return NULL;
+}
+static inline bool transaction_inode_get_size(const struct inode *inode, loff_t *size) {
+	return false;
+}
+static inline bool transaction_inode_set_size(struct inode *inode, loff_t size) {
+	return false;
+}
+static inline bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
+						  						  const struct iattr *attr) {
+	return false;
+}
+static inline int transaction_inode_read(struct inode *inode) {
+	return 0;
+}
 static inline int transaction_inode_snapshot(struct inode *inode) {
 	return 0;
 }

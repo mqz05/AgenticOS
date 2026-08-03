@@ -368,6 +368,7 @@ struct inode *alloc_inode(struct super_block *sb)
 void __destroy_inode(struct inode *inode)
 {
 	BUG_ON(inode_has_buffers(inode));
+	transaction_inode_destroy(inode);
 	inode_detach_wb(inode);
 	security_inode_free(inode);
 	fsnotify_inode_delete(inode);
@@ -415,6 +416,17 @@ static void destroy_inode(struct inode *inode)
  */
 void drop_nlink(struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			WARN_ON(shadow_inode->i_nlink == 0);
+			shadow_inode->i_nlink--;
+		}
+		return;
+	}
+#endif
 	WARN_ON(inode->i_nlink == 0);
 	inode->__i_nlink--;
 	if (!inode->i_nlink)
@@ -432,6 +444,15 @@ EXPORT_SYMBOL(drop_nlink);
  */
 void clear_nlink(struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode))
+			shadow_inode->i_nlink = 0;
+		return;
+	}
+#endif
 	if (inode->i_nlink) {
 		inode->__i_nlink = 0;
 		atomic_long_inc(&inode->i_sb->s_remove_count);
@@ -449,6 +470,15 @@ EXPORT_SYMBOL(clear_nlink);
  */
 void set_nlink(struct inode *inode, unsigned int nlink)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode))
+			shadow_inode->i_nlink = nlink;
+		return;
+	}
+#endif
 	if (!nlink) {
 		clear_nlink(inode);
 	} else {
@@ -471,6 +501,18 @@ EXPORT_SYMBOL(set_nlink);
  */
 void inc_nlink(struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			if (unlikely(shadow_inode->i_nlink == 0))
+				WARN_ON(!(inode->i_state & I_LINKABLE));
+			shadow_inode->i_nlink++;
+		}
+		return;
+	}
+#endif
 	if (unlikely(inode->i_nlink == 0)) {
 		WARN_ON(!(inode->i_state & I_LINKABLE));
 		atomic_long_dec(&inode->i_sb->s_remove_count);
@@ -2689,7 +2731,18 @@ EXPORT_SYMBOL(inode_dio_wait_interruptible);
 void inode_set_flags(struct inode *inode, unsigned int flags,
 		     unsigned int mask)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+#endif
+
 	WARN_ON_ONCE(flags & ~mask);
+#ifdef CONFIG_TRANSACTIONS
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode))
+			set_mask_bits(&shadow_inode->i_flags, mask, flags);
+		return;
+	}
+#endif
 	set_mask_bits(&inode->i_flags, mask, flags);
 }
 EXPORT_SYMBOL(inode_set_flags);
@@ -2702,8 +2755,21 @@ EXPORT_SYMBOL(inode_nohighmem);
 
 struct timespec64 inode_set_ctime_to_ts(struct inode *inode, struct timespec64 ts)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+#endif
+
 	trace_inode_set_ctime_to_ts(inode, &ts);
 	set_normalized_timespec64(&ts, ts.tv_sec, ts.tv_nsec);
+#ifdef CONFIG_TRANSACTIONS
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			shadow_inode->i_ctime_sec = ts.tv_sec;
+			shadow_inode->i_ctime_nsec = ts.tv_nsec;
+		}
+		return ts;
+	}
+#endif
 	inode->i_ctime_sec = ts.tv_sec;
 	inode->i_ctime_nsec = ts.tv_nsec;
 	return ts;
@@ -2762,6 +2828,36 @@ struct timespec64 inode_set_ctime_current(struct inode *inode)
 {
 	struct timespec64 now;
 	u32 cns, cur;
+
+#ifdef CONFIG_TRANSACTIONS
+	{
+		struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+		if (shadow_inode) {
+			if (IS_ERR(shadow_inode))
+				return inode_get_ctime(inode);
+			ktime_get_coarse_real_ts64_mg(&now);
+			now = timestamp_truncate(now, inode);
+			if (is_mgtime(inode)) {
+				struct timespec64 ctime;
+
+				cns = shadow_inode->i_ctime_nsec;
+				ctime.tv_sec = shadow_inode->i_ctime_sec;
+				ctime.tv_nsec = cns & ~I_CTIME_QUERIED;
+				if ((cns & I_CTIME_QUERIED) &&
+				    timespec64_compare(&now, &ctime) <= 0) {
+					ktime_get_real_ts64_mg(&now);
+					now = timestamp_truncate(now, inode);
+					mgtime_counter_inc(mg_fine_stamps);
+				}
+				mgtime_counter_inc(mg_ctime_updates);
+			}
+			shadow_inode->i_ctime_sec = now.tv_sec;
+			shadow_inode->i_ctime_nsec = now.tv_nsec;
+			return now;
+		}
+	}
+#endif
 
 	ktime_get_coarse_real_ts64_mg(&now);
 	now = timestamp_truncate(now, inode);
@@ -2844,6 +2940,28 @@ struct timespec64 inode_set_ctime_deleg(struct inode *inode, struct timespec64 u
 {
 	struct timespec64 now, cur_ts;
 	u32 cur, old;
+
+#ifdef CONFIG_TRANSACTIONS
+	{
+		struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+		if (shadow_inode) {
+			if (IS_ERR(shadow_inode))
+				return inode_get_ctime(inode);
+			cur_ts.tv_sec = shadow_inode->i_ctime_sec;
+			cur_ts.tv_nsec = shadow_inode->i_ctime_nsec & ~I_CTIME_QUERIED;
+			if (timespec64_compare(&update, &cur_ts) <= 0)
+				return cur_ts;
+			ktime_get_coarse_real_ts64_mg(&now);
+			if (timespec64_compare(&update, &now) > 0)
+				update = now;
+			update = timestamp_truncate(update, inode);
+			shadow_inode->i_ctime_sec = update.tv_sec;
+			shadow_inode->i_ctime_nsec = update.tv_nsec;
+			return update;
+		}
+	}
+#endif
 
 	/* pairs with try_cmpxchg below */
 	cur = smp_load_acquire(&inode->i_ctime_nsec);

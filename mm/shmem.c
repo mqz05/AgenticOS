@@ -2960,7 +2960,7 @@ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
 
 	file_accessed(file);
 	/* This is anonymous shared memory if it is unlinked at the time of mmap */
-	if (inode->i_nlink)
+	if (inode_get_nlink(inode))
 		vma->vm_ops = &shmem_vm_ops;
 	else
 		vma->vm_ops = &shmem_anon_vm_ops;
@@ -3884,7 +3884,7 @@ shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (error)
 		goto out_iput;
 
-	dir->i_size += BOGO_DIRENT_SIZE;
+	i_size_write(dir, i_size_read(dir) + BOGO_DIRENT_SIZE);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	inode_inc_iversion(dir);
 
@@ -3963,7 +3963,7 @@ static int shmem_link(struct dentry *old_dentry, struct inode *dir,
 	 * But if an O_TMPFILE file is linked into the tmpfs, the
 	 * first link must skip that, to get the accounting right.
 	 */
-	if (inode->i_nlink) {
+	if (inode_get_nlink(inode)) {
 		ret = shmem_reserve_inode(inode->i_sb, NULL);
 		if (ret)
 			goto out;
@@ -3971,12 +3971,12 @@ static int shmem_link(struct dentry *old_dentry, struct inode *dir,
 
 	ret = simple_offset_add(shmem_get_offset_ctx(dir), dentry);
 	if (ret) {
-		if (inode->i_nlink)
+		if (inode_get_nlink(inode))
 			shmem_free_inode(inode->i_sb, 0);
 		goto out;
 	}
 
-	dir->i_size += BOGO_DIRENT_SIZE;
+	i_size_write(dir, i_size_read(dir) + BOGO_DIRENT_SIZE);
 	inode_set_mtime_to_ts(dir,
 			      inode_set_ctime_to_ts(dir, inode_set_ctime_current(inode)));
 	inode_inc_iversion(dir);
@@ -3995,12 +3995,12 @@ static int shmem_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(dentry);
 
-	if (inode->i_nlink > 1 && !S_ISDIR(inode->i_mode))
+	if (inode_get_nlink(inode) > 1 && !S_ISDIR(inode_get_mode(inode)))
 		shmem_free_inode(inode->i_sb, 0);
 
 	simple_offset_remove(shmem_get_offset_ctx(dir), dentry);
 
-	dir->i_size -= BOGO_DIRENT_SIZE;
+	i_size_write(dir, i_size_read(dir) - BOGO_DIRENT_SIZE);
 	inode_set_mtime_to_ts(dir,
 			      inode_set_ctime_to_ts(dir, inode_set_ctime_current(inode)));
 	inode_inc_iversion(dir);
@@ -4066,7 +4066,7 @@ static int shmem_rename2(struct mnt_idmap *idmap,
 			 unsigned int flags)
 {
 	struct inode *inode = d_inode(old_dentry);
-	int they_are_dirs = S_ISDIR(inode->i_mode);
+	int they_are_dirs = S_ISDIR(inode_get_mode(inode));
 	bool had_offset = false;
 	int error;
 
@@ -4108,8 +4108,8 @@ static int shmem_rename2(struct mnt_idmap *idmap,
 		inc_nlink(new_dir);
 	}
 
-	old_dir->i_size -= BOGO_DIRENT_SIZE;
-	new_dir->i_size += BOGO_DIRENT_SIZE;
+	i_size_write(old_dir, i_size_read(old_dir) - BOGO_DIRENT_SIZE);
+	i_size_write(new_dir, i_size_read(new_dir) + BOGO_DIRENT_SIZE);
 	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
 	inode_inc_iversion(old_dir);
 	inode_inc_iversion(new_dir);
@@ -4165,7 +4165,7 @@ static int shmem_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		folio_unlock(folio);
 		folio_put(folio);
 	}
-	dir->i_size += BOGO_DIRENT_SIZE;
+	i_size_write(dir, i_size_read(dir) + BOGO_DIRENT_SIZE);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	inode_inc_iversion(dir);
 	if (IS_ENABLED(CONFIG_UNICODE) && IS_CASEFOLDED(dir))

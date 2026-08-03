@@ -44,7 +44,13 @@
  */
 void fill_mg_cmtime(struct kstat *stat, u32 request_mask, struct inode *inode)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible(inode);
+	atomic_t *pcn = contents ? (atomic_t *)&contents->i_ctime_nsec :
+				   (atomic_t *)&inode->i_ctime_nsec;
+#else
 	atomic_t *pcn = (atomic_t *)&inode->i_ctime_nsec;
+#endif
 
 	/* If neither time was requested, then don't report them */
 	if (!(request_mask & (STATX_CTIME|STATX_MTIME))) {
@@ -53,10 +59,14 @@ void fill_mg_cmtime(struct kstat *stat, u32 request_mask, struct inode *inode)
 	}
 
 	stat->mtime = inode_get_mtime(inode);
-	stat->ctime.tv_sec = inode->i_ctime_sec;
+	stat->ctime.tv_sec = inode_get_ctime_sec(inode);
 	stat->ctime.tv_nsec = (u32)atomic_read(pcn);
 	if (!(stat->ctime.tv_nsec & I_CTIME_QUERIED))
 		stat->ctime.tv_nsec = ((u32)atomic_fetch_or(I_CTIME_QUERIED, pcn));
+#ifdef CONFIG_TRANSACTIONS
+	if (contents)
+		atomic_or(I_CTIME_QUERIED, (atomic_t *)&inode->i_ctime_nsec);
+#endif
 	stat->ctime.tv_nsec &= ~I_CTIME_QUERIED;
 	trace_fill_mg_cmtime(inode, &stat->ctime, &stat->mtime);
 }
@@ -82,11 +92,39 @@ EXPORT_SYMBOL(fill_mg_cmtime);
 void generic_fillattr(struct mnt_idmap *idmap, u32 request_mask,
 		      struct inode *inode, struct kstat *stat)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *contents = transaction_inode_visible(inode);
+#endif
 	vfsuid_t vfsuid = i_uid_into_vfsuid(idmap, inode);
 	vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, inode);
 
 	stat->dev = inode->i_sb->s_dev;
 	stat->ino = inode->i_ino;
+#ifdef CONFIG_TRANSACTIONS
+	if (contents) {
+		vfsuid = make_vfsuid(idmap, i_user_ns(inode), contents->i_uid);
+		vfsgid = make_vfsgid(idmap, i_user_ns(inode), contents->i_gid);
+		stat->mode = contents->i_mode;
+		stat->nlink = contents->i_nlink;
+		stat->uid = vfsuid_into_kuid(vfsuid);
+		stat->gid = vfsgid_into_kgid(vfsgid);
+		stat->rdev = inode->i_rdev;
+		stat->size = contents->i_size;
+		stat->atime.tv_sec = contents->i_atime_sec;
+		stat->atime.tv_nsec = contents->i_atime_nsec;
+		if (is_mgtime(inode)) {
+			fill_mg_cmtime(stat, request_mask, inode);
+		} else {
+			stat->mtime.tv_sec = contents->i_mtime_sec;
+			stat->mtime.tv_nsec = contents->i_mtime_nsec;
+			stat->ctime.tv_sec = contents->i_ctime_sec;
+			stat->ctime.tv_nsec = contents->i_ctime_nsec & ~I_CTIME_QUERIED;
+		}
+		stat->blksize = i_blocksize(inode);
+		stat->blocks = inode->i_blocks;
+		goto version;
+	}
+#endif
 	stat->mode = inode->i_mode;
 	stat->nlink = inode->i_nlink;
 	stat->uid = vfsuid_into_kuid(vfsuid);
@@ -105,6 +143,9 @@ void generic_fillattr(struct mnt_idmap *idmap, u32 request_mask,
 	stat->blksize = i_blocksize(inode);
 	stat->blocks = inode->i_blocks;
 
+#ifdef CONFIG_TRANSACTIONS
+version:
+#endif
 	if ((request_mask & STATX_CHANGE_COOKIE) && IS_I_VERSION(inode)) {
 		stat->result_mask |= STATX_CHANGE_COOKIE;
 		stat->change_cookie = inode_query_iversion(inode);
@@ -123,9 +164,9 @@ EXPORT_SYMBOL(generic_fillattr);
  */
 void generic_fill_statx_attr(struct inode *inode, struct kstat *stat)
 {
-	if (inode->i_flags & S_IMMUTABLE)
+	if (inode_get_flags(inode) & S_IMMUTABLE)
 		stat->attributes |= STATX_ATTR_IMMUTABLE;
-	if (inode->i_flags & S_APPEND)
+	if (inode_get_flags(inode) & S_APPEND)
 		stat->attributes |= STATX_ATTR_APPEND;
 	stat->attributes_mask |= KSTAT_ATTR_VFS_FLAGS;
 }
@@ -183,6 +224,11 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
 {
 	struct mnt_idmap *idmap;
 	struct inode *inode = d_backing_inode(path->dentry);
+	int error;
+
+	error = transaction_inode_read(inode);
+	if (error)
+		return error;
 
 	memset(stat, 0, sizeof(*stat));
 	stat->result_mask |= STATX_BASIC_STATS;

@@ -34,7 +34,7 @@
 int setattr_should_drop_sgid(struct mnt_idmap *idmap,
 			     const struct inode *inode)
 {
-	umode_t mode = inode->i_mode;
+	umode_t mode = inode_get_mode(inode);
 
 	if (!(mode & S_ISGID))
 		return 0;
@@ -64,7 +64,7 @@ EXPORT_SYMBOL(setattr_should_drop_sgid);
 int setattr_should_drop_suidgid(struct mnt_idmap *idmap,
 				struct inode *inode)
 {
-	umode_t mode = inode->i_mode;
+	umode_t mode = inode_get_mode(inode);
 	int kill = 0;
 
 	/* suid always must be killed */
@@ -246,7 +246,7 @@ int inode_newsize_ok(const struct inode *inode, loff_t offset)
 {
 	if (offset < 0)
 		return -EINVAL;
-	if (inode->i_size < offset) {
+	if (i_size_read(inode) < offset) {
 		unsigned long limit;
 
 		limit = rlimit(RLIMIT_FSIZE);
@@ -335,6 +335,9 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
 {
 	unsigned int ia_valid = attr->ia_valid;
 
+	if (transaction_inode_setattr_copy(idmap, inode, attr))
+		return;
+
 	i_uid_update(idmap, attr, inode);
 	i_gid_update(idmap, attr, inode);
 	if (ia_valid & ATTR_MODE) {
@@ -419,7 +422,7 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 		  struct iattr *attr, struct inode **delegated_inode)
 {
 	struct inode *inode = dentry->d_inode;
-	umode_t mode = inode->i_mode;
+	umode_t mode = inode_get_mode(inode);
 	int error;
 	struct timespec64 now;
 	unsigned int ia_valid = attr->ia_valid;
@@ -445,12 +448,16 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * (3) To even do this in the first place one would have to use
 		 *     specific file descriptors and quite some effort.
 		 */
-		if (S_ISLNK(inode->i_mode))
+		if (S_ISLNK(inode_get_mode(inode)))
 			return -EOPNOTSUPP;
 
 		/* Flag setting protected by i_rwsem */
-		if (is_sxid(attr->ia_mode))
-			inode->i_flags &= ~S_NOSEC;
+		if (is_sxid(attr->ia_mode)) {
+			error = transaction_inode_snapshot(inode);
+			if (error)
+				return error;
+			inode_set_flags(inode, 0, S_NOSEC);
+		}
 	}
 
 	now = current_time(inode);
@@ -490,14 +497,14 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ia_valid & ATTR_KILL_SUID) {
 		if (mode & S_ISUID) {
 			ia_valid = attr->ia_valid |= ATTR_MODE;
-			attr->ia_mode = (inode->i_mode & ~S_ISUID);
+			attr->ia_mode = (inode_get_mode(inode) & ~S_ISUID);
 		}
 	}
 	if (ia_valid & ATTR_KILL_SGID) {
 		if (mode & S_ISGID) {
 			if (!(ia_valid & ATTR_MODE)) {
 				ia_valid = attr->ia_valid |= ATTR_MODE;
-				attr->ia_mode = inode->i_mode;
+				attr->ia_mode = inode_get_mode(inode);
 			}
 			attr->ia_mode &= ~S_ISGID;
 		}
