@@ -18,6 +18,8 @@
 
 struct path;
 struct file;
+struct inode;
+struct dentry_operations;
 struct vfsmount;
 
 /*
@@ -90,6 +92,27 @@ union shortname_store {
 #define d_lock	d_lockref.lock
 #define d_iname d_shortname.string
 
+struct dentry;
+
+#ifdef CONFIG_TRANSACTIONS
+/* Transactionally mutable dentry contents. */
+struct _dentry {
+	struct dentry *parent;
+	struct _dentry *shadow;
+	refcount_t tx_refcount;
+	struct rcu_head d_rcu;
+	bool embedded;
+	unsigned int d_flags;
+	struct inode *d_inode;
+	struct dentry *d_parent;
+	struct qstr d_name;
+	union shortname_store d_shortname;
+	unsigned long d_time;
+	const struct dentry_operations *d_op;
+	void *relations;
+};
+#endif
+
 struct dentry {
 	/* RCU lookup touched fields */
 	unsigned int d_flags;		/* protected by d_lock */
@@ -132,8 +155,18 @@ struct dentry {
 	} d_u;
 #ifdef CONFIG_TRANSACTIONS
 	struct transaction_object transaction_object;
+	struct _dentry __rcu *d_contents;
+	struct _dentry d_committed;
 #endif
 };
+
+static inline unsigned int dentry_get_flags(const struct dentry *dentry) {
+	unsigned int flags;
+
+	if (transaction_dentry_get_flags(dentry, &flags))
+		return flags;
+	return READ_ONCE(dentry->d_flags);
+}
 
 /*
  * dentry->d_lock spinlock nesting subclasses:
@@ -376,13 +409,14 @@ static inline int d_unlinked(const struct dentry *dentry)
 
 static inline int cant_mount(const struct dentry *dentry)
 {
-	return (dentry->d_flags & DCACHE_CANT_MOUNT);
+	return dentry_get_flags(dentry) & DCACHE_CANT_MOUNT;
 }
 
 static inline void dont_mount(struct dentry *dentry)
 {
 	spin_lock(&dentry->d_lock);
-	dentry->d_flags |= DCACHE_CANT_MOUNT;
+	if (!transaction_dentry_set_flags(dentry, DCACHE_CANT_MOUNT, DCACHE_CANT_MOUNT))
+		dentry->d_flags |= DCACHE_CANT_MOUNT;
 	spin_unlock(&dentry->d_lock);
 }
 
@@ -416,7 +450,7 @@ static inline bool d_mountpoint(const struct dentry *dentry)
  */
 static inline unsigned __d_entry_type(const struct dentry *dentry)
 {
-	return dentry->d_flags & DCACHE_ENTRY_TYPE;
+	return dentry_get_flags(dentry) & DCACHE_ENTRY_TYPE;
 }
 
 static inline bool d_is_miss(const struct dentry *dentry)
@@ -497,6 +531,12 @@ static inline bool d_is_positive(const struct dentry *dentry)
  */
 static inline bool d_really_is_negative(const struct dentry *dentry)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _dentry *contents = transaction_dentry_visible((struct dentry *)dentry);
+
+	if (contents)
+		return contents->d_inode == NULL;
+#endif
 	return dentry->d_inode == NULL;
 }
 
@@ -515,6 +555,12 @@ static inline bool d_really_is_negative(const struct dentry *dentry)
  */
 static inline bool d_really_is_positive(const struct dentry *dentry)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _dentry *contents = transaction_dentry_visible((struct dentry *)dentry);
+
+	if (contents)
+		return contents->d_inode != NULL;
+#endif
 	return dentry->d_inode != NULL;
 }
 
@@ -534,6 +580,12 @@ unsigned long vfs_pressure_ratio(unsigned long val);
  */
 static inline struct inode *d_inode(const struct dentry *dentry)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _dentry *contents = transaction_dentry_visible((struct dentry *)dentry);
+
+	if (contents)
+		return contents->d_inode;
+#endif
 	return dentry->d_inode;
 }
 

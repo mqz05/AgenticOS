@@ -4724,7 +4724,7 @@ out:
 	inode_unlock(target);
 
 	/* We don't d_delete() NFS sillyrenamed files--they still exist. */
-	if (!error && dentry->d_flags & DCACHE_NFSFS_RENAMED) {
+	if (!error && dentry_get_flags(dentry) & DCACHE_NFSFS_RENAMED) {
 		fsnotify_unlink(dir, dentry);
 	} else if (!error) {
 		fsnotify_link_count(target);

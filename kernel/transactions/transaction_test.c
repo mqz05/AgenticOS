@@ -1504,12 +1504,12 @@ static void transaction_inode_refresh_committed_test(struct kunit *test) {
 }
 
 static void transaction_dentry_metadata_abort_test(struct kunit *test) {
+	struct _dentry *shadow_dentry;
 	struct transaction *transaction;
 	struct dentry *dentry;
 	struct file *file;
 	unsigned int original_flags;
 	unsigned long original_time;
-	void *original_fsdata;
 
 	file = anon_inode_getfile("[transaction-dentry-test]",
 				  &transaction_test_file_operations, NULL, 0);
@@ -1519,41 +1519,47 @@ static void transaction_dentry_metadata_abort_test(struct kunit *test) {
 
 	original_flags = dentry->d_flags;
 	original_time = dentry->d_time;
-	original_fsdata = dentry->d_fsdata;
 	transaction = transaction_alloc(GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, transaction);
 	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	shadow_dentry = transaction_dentry_visible(dentry);
+	KUNIT_ASSERT_NOT_NULL(test, shadow_dentry);
+	KUNIT_EXPECT_PTR_NE(test, shadow_dentry, rcu_access_pointer(dentry->d_contents));
+	KUNIT_EXPECT_PTR_EQ(test, shadow_dentry->shadow,
+			    rcu_access_pointer(dentry->d_contents));
 	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer,
 			    transaction);
 	KUNIT_EXPECT_FALSE(test,
 			   list_empty(&dentry->transaction_object.readers));
 
-	spin_lock(&dentry->d_lock);
-	dentry->d_flags = original_flags ^ DCACHE_REFERENCED;
-	dentry->d_time = original_time + 10;
-	dentry->d_fsdata = test;
-	spin_unlock(&dentry->d_lock);
+	shadow_dentry->d_flags = original_flags ^ DCACHE_CANT_MOUNT;
+	shadow_dentry->d_time = original_time + 10;
+	dentry->d_flags |= DCACHE_NOKEY_NAME;
+	KUNIT_EXPECT_EQ(test, dentry->d_flags, original_flags | DCACHE_NOKEY_NAME);
+	KUNIT_EXPECT_EQ(test, dentry->d_time, original_time);
 
 	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
-	KUNIT_EXPECT_EQ(test, dentry->d_flags, original_flags);
+	KUNIT_EXPECT_EQ(test, dentry->d_flags, original_flags | DCACHE_NOKEY_NAME);
 	KUNIT_EXPECT_EQ(test, dentry->d_time, original_time);
-	KUNIT_EXPECT_PTR_EQ(test, dentry->d_fsdata, original_fsdata);
 	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer, NULL);
 	KUNIT_EXPECT_TRUE(test,
 			  list_empty(&dentry->transaction_object.readers));
+	dentry->d_flags = original_flags;
 	transaction_detach_task(current);
 	transaction_put(transaction);
 	fput(file);
 }
 
 static void transaction_dentry_metadata_commit_test(struct kunit *test) {
+	struct _dentry *shadow_dentry;
 	struct transaction *transaction;
 	struct dentry *dentry;
 	struct file *file;
 	unsigned int updated_flags;
+	unsigned int original_flags;
 	unsigned long updated_time;
 
 	file = anon_inode_getfile("[transaction-dentry-test]",
@@ -1561,34 +1567,135 @@ static void transaction_dentry_metadata_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
 	dentry = file->f_path.dentry;
 	KUNIT_ASSERT_NOT_NULL(test, dentry);
+	original_flags = dentry->d_flags;
 
 	transaction = transaction_alloc(GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, transaction);
 	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	shadow_dentry = transaction_dentry_visible(dentry);
+	KUNIT_ASSERT_NOT_NULL(test, shadow_dentry);
+	KUNIT_EXPECT_PTR_EQ(test, shadow_dentry->shadow,
+			    rcu_access_pointer(dentry->d_contents));
 	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer,
 			    transaction);
 	KUNIT_EXPECT_FALSE(test,
 			   list_empty(&dentry->transaction_object.readers));
 
-	updated_flags = dentry->d_flags ^ DCACHE_REFERENCED;
+	updated_flags = dentry->d_flags ^ DCACHE_CANT_MOUNT;
 	updated_time = dentry->d_time + 10;
-	spin_lock(&dentry->d_lock);
-	dentry->d_flags = updated_flags;
-	dentry->d_time = updated_time;
-	dentry->d_fsdata = test;
-	spin_unlock(&dentry->d_lock);
+	shadow_dentry->d_flags = updated_flags;
+	shadow_dentry->d_time = updated_time;
+	dentry->d_flags |= DCACHE_NOKEY_NAME;
+	KUNIT_EXPECT_NE(test, dentry->d_flags, updated_flags);
+	KUNIT_EXPECT_NE(test, dentry->d_time, updated_time);
 
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
-	KUNIT_EXPECT_EQ(test, dentry->d_flags, updated_flags);
+	KUNIT_EXPECT_EQ(test, dentry->d_flags, updated_flags | DCACHE_NOKEY_NAME);
 	KUNIT_EXPECT_EQ(test, dentry->d_time, updated_time);
-	KUNIT_EXPECT_PTR_EQ(test, dentry->d_fsdata, test);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(dentry->d_contents), shadow_dentry);
+	KUNIT_EXPECT_PTR_EQ(test, shadow_dentry->shadow, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer, NULL);
 	KUNIT_EXPECT_TRUE(test,
 			  list_empty(&dentry->transaction_object.readers));
+	dentry->d_flags = original_flags;
 	transaction_detach_task(current);
 	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_dentry_read_version_test(struct kunit *test) {
+	struct _dentry *contents;
+	struct transaction *transaction;
+	struct dentry *dentry;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-dentry-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	dentry = file->f_path.dentry;
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	contents = transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, contents);
+	KUNIT_EXPECT_PTR_EQ(test, contents, rcu_access_pointer(dentry->d_contents));
+	KUNIT_EXPECT_PTR_EQ(test, contents->shadow, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, transaction_dentry_visible(dentry), contents);
+	KUNIT_EXPECT_PTR_EQ(test, dentry->transaction_object.writer, NULL);
+	KUNIT_EXPECT_FALSE(test, list_empty(&dentry->transaction_object.readers));
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&dentry->transaction_object.readers));
+	transaction_test_finish_current(transaction);
+	fput(file);
+}
+
+static void transaction_dentry_refresh_committed_test(struct kunit *test) {
+	struct _dentry *shadow;
+	struct transaction *transaction;
+	struct dentry *dentry;
+	struct file *file;
+	unsigned long first_time;
+
+	file = anon_inode_getfile("[transaction-dentry-test]",
+				  &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	dentry = file->f_path.dentry;
+	first_time = dentry->d_time + 10;
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	shadow = transaction_dentry_visible(dentry);
+	KUNIT_ASSERT_NOT_NULL(test, shadow);
+	shadow->d_time = first_time;
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+
+	dentry->d_time = first_time + 10;
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	shadow = transaction_dentry_visible(dentry);
+	KUNIT_ASSERT_NOT_NULL(test, shadow);
+	KUNIT_EXPECT_EQ(test, shadow->d_time, first_time + 10);
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_EQ(test, dentry->d_time, first_time + 10);
+	fput(file);
+}
+
+static void transaction_dentry_external_name_test(struct kunit *test) {
+	static const char old_name[] = "transaction-dentry-old-name-that-does-not-fit-inline-storage";
+	static const char new_name[] = "transaction-dentry-new-name-that-does-not-fit-inline-storage";
+	struct transaction *transaction;
+	struct dentry *dentry;
+	struct dentry *parent;
+	struct dentry *target;
+	struct inode *inode;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-dentry-test]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	parent = file->f_path.dentry;
+	dentry = d_alloc_name(parent, old_name);
+	KUNIT_ASSERT_NOT_NULL(test, dentry);
+	target = d_alloc_name(parent, new_name);
+	KUNIT_ASSERT_NOT_NULL(test, target);
+	inode = igrab(file_inode(file));
+	KUNIT_ASSERT_NOT_NULL(test, inode);
+	d_instantiate(dentry, inode);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	d_move(dentry, target);
+	KUNIT_EXPECT_STREQ(test, (const char *)dentry->d_name.name, new_name);
+	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_STREQ(test, (const char *)dentry->d_name.name, old_name);
+	transaction_test_finish_current(transaction);
+	dput(target);
+	dput(dentry);
 	fput(file);
 }
 
@@ -1793,6 +1900,9 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_inode_refresh_committed_test),
 	KUNIT_CASE(transaction_dentry_metadata_abort_test),
 	KUNIT_CASE(transaction_dentry_metadata_commit_test),
+	KUNIT_CASE(transaction_dentry_read_version_test),
+	KUNIT_CASE(transaction_dentry_refresh_committed_test),
+	KUNIT_CASE(transaction_dentry_external_name_test),
 	KUNIT_CASE(transaction_hlist_restore_test),
 	KUNIT_CASE(transaction_hlist_bl_restore_test),
 	KUNIT_CASE(transaction_dentry_sibling_abort_test),

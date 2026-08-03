@@ -19,6 +19,7 @@ struct file;
 struct inode;
 struct _inode;
 struct dentry;
+struct _dentry;
 struct iattr;
 struct mnt_idmap;
 struct transaction;
@@ -194,6 +195,16 @@ bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode
 int transaction_inode_read(struct inode *inode);
 int transaction_inode_snapshot(struct inode *inode);
 void transaction_dentry_init(struct dentry *dentry);
+void transaction_dentry_destroy(struct dentry *dentry);
+void transaction_dentry_name_get(struct _dentry *contents, struct dentry *dentry);
+void transaction_dentry_name_copy(struct _dentry *dest, const struct _dentry *source);
+void transaction_dentry_name_put(struct _dentry *contents);
+void transaction_dentry_name_restore(struct dentry *dentry, const struct _dentry *contents);
+struct _dentry *transaction_dentry_get(struct dentry *dentry, enum transaction_access_mode mode);
+struct _dentry *transaction_dentry_visible(struct dentry *dentry);
+struct _dentry *transaction_dentry_shadow(struct dentry *dentry);
+bool transaction_dentry_get_flags(const struct dentry *dentry, unsigned int *flags);
+bool transaction_dentry_set_flags(struct dentry *dentry, unsigned int flags, unsigned int mask);
 int transaction_dentry_snapshot(struct dentry *dentry);
 int transaction_dentry_snapshot_locked(struct dentry *dentry);
 int transaction_dentry_snapshot_unlink(struct dentry *dentry);
@@ -258,6 +269,20 @@ static inline int transaction_inode_snapshot(struct inode *inode) {
 	return 0;
 }
 static inline void transaction_dentry_init(struct dentry *dentry) { }
+static inline void transaction_dentry_destroy(struct dentry *dentry) { }
+static inline struct _dentry *transaction_dentry_visible(struct dentry *dentry) {
+	return NULL;
+}
+static inline struct _dentry *transaction_dentry_shadow(struct dentry *dentry) {
+	return NULL;
+}
+static inline bool transaction_dentry_get_flags(const struct dentry *dentry, unsigned int *flags) {
+	return false;
+}
+static inline bool transaction_dentry_set_flags(struct dentry *dentry, unsigned int flags,
+						 unsigned int mask) {
+	return false;
+}
 static inline int transaction_dentry_snapshot(struct dentry *dentry) {
 	return 0;
 }
