@@ -571,9 +571,9 @@ int inode_permission(struct mnt_idmap *idmap,
 {
 	int retval;
 
-	if (current_transaction()) {
-		if (mask & MAY_NOT_BLOCK)
-			return -ECHILD;
+	if (current_transaction() && (mask & MAY_NOT_BLOCK))
+		return -ECHILD;
+	if (!(mask & MAY_NOT_BLOCK)) {
 		retval = transaction_inode_read(inode);
 		if (retval)
 			return retval;

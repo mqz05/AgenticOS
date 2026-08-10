@@ -429,10 +429,23 @@ bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode
 EXPORT_SYMBOL_GPL(transaction_inode_setattr_copy);
 
 int transaction_inode_read(struct inode *inode) {
+	struct transaction *winner;
 	struct _inode *contents;
+	int ret;
 
-	if (!current_transaction())
-		return 0;
+	if (!inode)
+		return -EINVAL;
+	if (!current_transaction()) {
+		for (;;) {
+			winner = transaction_check_asymmetric_conflict(&inode->transaction_object,
+									       TRANSACTION_ACCESS_READ, true, &ret);
+			if (!winner)
+				return ret;
+			ret = transaction_wait_on_conflict(winner);
+			if (ret)
+				return ret;
+		}
+	}
 	contents = transaction_inode_get(inode, TRANSACTION_ACCESS_READ);
 	return IS_ERR(contents) ? PTR_ERR(contents) : 0;
 }
@@ -440,10 +453,21 @@ EXPORT_SYMBOL_GPL(transaction_inode_read);
 
 /* Add this inode to the current transaction's workset for read/write access. */
 int transaction_inode_snapshot(struct inode *inode) {
+	struct transaction *winner;
 	struct _inode *shadow_inode;
+	int ret;
 
-	if (!current_transaction())
-		return 0;
+	if (!inode)
+		return -EINVAL;
+	if (!current_transaction()) {
+		winner = transaction_check_asymmetric_conflict(&inode->transaction_object,
+								       TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+		if (WARN_ON_ONCE(winner)) {
+			transaction_put(winner);
+			return -EUCLEAN;
+		}
+		return ret;
+	}
 	shadow_inode = transaction_inode_get(inode, TRANSACTION_ACCESS_READ_WRITE);
 	return IS_ERR(shadow_inode) ? PTR_ERR(shadow_inode) : 0;
 }

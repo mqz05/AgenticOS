@@ -89,12 +89,13 @@ loff_t transaction_file_get_pos(struct file * file) {
 EXPORT_SYMBOL_GPL(transaction_file_get_pos);
 
 /* Add this file to the current transaction's workset and snapshot its current offset.
-   If the current task is not in a live transaction, this is a no-op.
+   Ordinary accesses resolve asymmetric ownership before using the stable offset.
    If the file is already in the workset, the existing shadow offset is reused. */
 int transaction_file_snapshot(struct file * file) {
 	struct txobj_thread_list_node * node;
 	struct transaction_file_shadow * shadow;
 	struct transaction * transaction;
+	struct transaction *winner;
 	enum transaction_state status;
 	int ret;
 
@@ -102,8 +103,15 @@ int transaction_file_snapshot(struct file * file) {
 		return -EINVAL;
 
 	transaction = current_transaction();
-	if (!transaction)
-		return 0;
+	if (!transaction) {
+		winner = transaction_check_asymmetric_conflict(&file->transaction_object,
+								       TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+		if (WARN_ON_ONCE(winner)) {
+			transaction_put(winner);
+			return -EUCLEAN;
+		}
+		return ret;
+	}
 
 	status = transaction_status(transaction);
 	if (status == TRANSACTION_ABORTED || status == TRANSACTION_ABORTING)
@@ -166,6 +174,7 @@ int transaction_file_set_pos(struct file * file, loff_t pos) {
 	struct txobj_thread_list_node *node;
 	struct transaction_file_shadow *shadow;
 	struct transaction *transaction;
+	struct transaction *winner;
 	int ret;
 
 	if (!file)
@@ -173,6 +182,14 @@ int transaction_file_set_pos(struct file * file, loff_t pos) {
 
 	transaction = current_transaction();
 	if (!transaction) {
+		winner = transaction_check_asymmetric_conflict(&file->transaction_object,
+								       TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+		if (WARN_ON_ONCE(winner)) {
+			transaction_put(winner);
+			return -EUCLEAN;
+		}
+		if (ret)
+			return ret;
 		file->f_pos = pos;
 		return 0;
 	}

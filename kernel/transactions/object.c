@@ -3,6 +3,7 @@
 
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/sched.h>
 #include <linux/transaction.h>
 
 void transaction_object_init(struct transaction_object *object, enum transaction_object_type type) {
@@ -25,6 +26,176 @@ static struct txobj_thread_list_node *object_find_reader(struct transaction_obje
 
 	return NULL;
 }
+
+// Return the first transactional owner that beats the ordinary caller.
+static struct transaction *transaction_object_waiter_locked(struct transaction_object *object,
+							      enum transaction_access_mode mode) {
+	struct txobj_thread_list_node *reader;
+	struct transaction *writer = object->writer;
+	bool should_sleep;
+
+	lockdep_assert_held(&object->lock);
+	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
+		// Writers also have reader-list entries, so this checks every owner.
+		list_for_each_entry(reader, &object->readers, object_list) {
+			if (transaction_contention_manager(reader->tx, NULL, &should_sleep) && should_sleep)
+				return reader->tx;
+		}
+		return NULL;
+	}
+	if (writer && transaction_contention_manager(writer, NULL, &should_sleep) && should_sleep)
+		return writer;
+	return NULL;
+}
+
+// Reject an owner whose state cannot be taken over.
+static int transaction_object_check_abortable(struct transaction *transaction) {
+	switch (transaction_status(transaction)) {
+	case TRANSACTION_ACTIVE:
+	case TRANSACTION_ABORTED:
+	case TRANSACTION_ABORTING:
+		return 0;
+	case TRANSACTION_COMMITTING:
+		return -EBUSY;
+	case TRANSACTION_INACTIVE:
+	default:
+		return -EUCLEAN;
+	}
+}
+
+// Abort an active owner, an owner already aborting needs no update.
+static int transaction_object_abort_active(struct transaction *transaction) {
+	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
+		return 0;
+	return abort_transaction(transaction);
+}
+
+// Abort and detach transactional owners after the ordinary caller wins.
+static int transaction_object_abort_conflicts_locked(struct transaction_object *object,
+						       enum transaction_access_mode mode) {
+	struct txobj_thread_list_node *reader;
+	struct txobj_thread_list_node *next;
+	struct transaction *writer = object->writer;
+	int ret;
+
+	lockdep_assert_held(&object->lock);
+	// Dentry relationships need transactional hlist conversion before takeover.
+	if (object->type != TRANSACTION_OBJECT_FILE && object->type != TRANSACTION_OBJECT_INODE)
+		return -EOPNOTSUPP;
+
+	// Check every owner before changing transaction or ownership state.
+	if (writer) {
+		ret = transaction_object_check_abortable(writer);
+		if (ret)
+			return ret;
+	}
+	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
+		list_for_each_entry(reader, &object->readers, object_list) {
+			if (reader->tx == writer)
+				continue;
+			ret = transaction_object_check_abortable(reader->tx);
+			if (ret)
+				return ret;
+		}
+	}
+
+	// The ordinary caller won, so abort each active owner.
+	if (writer) {
+		ret = transaction_object_abort_active(writer);
+		if (ret)
+			return ret;
+	}
+	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
+		list_for_each_entry(reader, &object->readers, object_list) {
+			if (reader->tx == writer)
+				continue;
+			ret = transaction_object_abort_active(reader->tx);
+			if (ret)
+				return ret;
+		}
+	}
+
+	// Referenced committed versions preserve the readers original snapshots.
+	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
+		list_for_each_entry_safe(reader, next, &object->readers, object_list)
+			list_del_init(&reader->object_list);
+		object->writer = NULL;
+	} else if (writer) {
+		list_for_each_entry_safe(reader, next, &object->readers, object_list) {
+			if (reader->tx == writer)
+				list_del_init(&reader->object_list);
+		}
+		object->writer = NULL;
+	}
+	return 0;
+}
+
+// Return a winner to wait on, or abort owners when the ordinary caller wins.
+struct transaction *transaction_check_asymmetric_conflict(struct transaction_object *object,
+							   enum transaction_access_mode mode,
+							   bool can_sleep, int *error) {
+	struct transaction *winner = NULL;
+	int ret;
+
+	if (error)
+		*error = 0;
+	if (!object) {
+		if (error)
+			*error = -EINVAL;
+		return NULL;
+	}
+	if (mode != TRANSACTION_ACCESS_READ && mode != TRANSACTION_ACCESS_READ_WRITE) {
+		if (error)
+			*error = -EOPNOTSUPP;
+		return NULL;
+	}
+	if (current_transaction())
+		return NULL;
+
+	spin_lock(&object->lock);
+	// Reads conflict with a writer, writes conflict with any owner.
+	if (!object->writer && (mode == TRANSACTION_ACCESS_READ || list_empty(&object->readers)))
+		// No conflict
+		goto out;
+	
+	// Preemptible non-transaction, contention manager decides winner
+	if (can_sleep) {
+		winner = transaction_object_waiter_locked(object, mode);
+		if (winner) {
+			transaction_get(winner);
+			goto out;
+		}
+	}
+
+	// Non-preemptible non-transaction wins over transactions
+	ret = transaction_object_abort_conflicts_locked(object, mode);
+	if (error)
+		*error = ret;
+	winner = NULL;
+out:
+	spin_unlock(&object->lock);
+	return winner;
+}
+EXPORT_SYMBOL_GPL(transaction_check_asymmetric_conflict);
+
+// Wait for the winning transaction to finish and consume its reference.
+int transaction_wait_on_conflict(struct transaction *winner) {
+	enum transaction_state status;
+	u64 timestamp;
+	int ret;
+
+	if (!winner)
+		return -EINVAL;
+	timestamp = READ_ONCE(winner->timestamp);
+	ret = wait_event_killable(winner->losers, ({
+		status = transaction_status(winner);
+		status == TRANSACTION_INACTIVE || status == TRANSACTION_ABORTED ||
+		status == TRANSACTION_ABORTING || READ_ONCE(winner->timestamp) != timestamp;
+	}));
+	transaction_put(winner);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(transaction_wait_on_conflict);
 
 static int transaction_object_lose(struct transaction *transaction, bool can_sleep, bool *should_sleep) {
 	int ret;

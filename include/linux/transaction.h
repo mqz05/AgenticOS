@@ -156,6 +156,10 @@ int transaction_object_acquire(struct transaction *transaction,
 			       struct txobj_thread_list_node *node,
 			       enum transaction_access_mode mode,
 			       bool *should_sleep);
+struct transaction *transaction_check_asymmetric_conflict(struct transaction_object *object,
+							   enum transaction_access_mode mode,
+							   bool can_sleep, int *error);
+int transaction_wait_on_conflict(struct transaction *winner);
 void transaction_object_remove_ownership_locked(struct txobj_thread_list_node *node);
 void transaction_object_remove_ownership(struct txobj_thread_list_node *node);
 

@@ -497,6 +497,9 @@ EXPORT_SYMBOL_GPL(transaction_dentry_set_flags);
 int transaction_dentry_snapshot(struct dentry *dentry) {
 	struct _dentry *shadow;
 
+	if (!dentry)
+		return -EINVAL;
+	// TODO: Resolve ordinary conflicts after dcache relationships use transactional hlists.
 	if (!current_transaction())
 		return 0;
 	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, false, false);
@@ -508,6 +511,8 @@ int transaction_dentry_snapshot_locked(struct dentry *dentry) {
 	struct _dentry *shadow;
 	struct transaction *transaction;
 
+	if (!dentry)
+		return -EINVAL;
 	transaction = current_transaction();
 	if (!transaction)
 		return 0;
@@ -522,6 +527,8 @@ EXPORT_SYMBOL_GPL(transaction_dentry_snapshot_locked);
 int transaction_dentry_snapshot_unlink(struct dentry *dentry) {
 	struct _dentry *shadow;
 
+	if (!dentry)
+		return -EINVAL;
 	if (!current_transaction())
 		return 0;
 	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, false, true);

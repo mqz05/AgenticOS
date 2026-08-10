@@ -420,10 +420,9 @@ static int transaction_best_priority(struct transaction *transaction) {
 
 /*
  * Contention manager function. Return true if a wins the conflict over b.
- * should_sleep indicates that two active transactions were arbitrated by
- * priority and timestamp, rather than by an abort or commit state. It does not
-	 * sleep here, in a future acquisition the retry path may use it to wait for
- * the winner to finish before retrying.
+ * should_sleep indicates that the loser may wait for the winner. Two active
+ * transactions use priority and timestamp; a NULL b represents an ordinary
+ * sleepable operation and uses the current task's scheduling priority.
  */
 bool transaction_contention_manager(struct transaction *a, struct transaction *b, bool *should_sleep) {
 	enum transaction_state status_a;
@@ -432,7 +431,29 @@ bool transaction_contention_manager(struct transaction *a, struct transaction *b
 	int priority_b;
 	bool priority_winner;
 
+	if (should_sleep)
+		*should_sleep = false;
+	if (!a)
+		return false;
+
 	status_a = transaction_status(a);
+	// TxOS represents an ordinary task with an inactive transaction at timestamp -1.
+	if (!b) {
+		if (status_a == TRANSACTION_COMMITTING) {
+			if (should_sleep)
+				*should_sleep = true;
+			return true;
+		}
+		if (status_a != TRANSACTION_ACTIVE)
+			return false;
+		priority_a = transaction_best_priority(a);
+		if (priority_a >= current->prio)
+			return false;
+		if (should_sleep)
+			*should_sleep = true;
+		return true;
+	}
+
 	status_b = transaction_status(b);
 	priority_a = transaction_best_priority(a);
 	priority_b = transaction_best_priority(b);
@@ -444,9 +465,6 @@ bool transaction_contention_manager(struct transaction *a, struct transaction *b
 		priority_winner = false;
 	else
 		priority_winner = READ_ONCE(a->timestamp) < READ_ONCE(b->timestamp);
-
-	if (should_sleep)
-		*should_sleep = false;
 
 	// Aborted transactions have to lose.
 	if (status_a == TRANSACTION_ABORTED || status_a == TRANSACTION_ABORTING)

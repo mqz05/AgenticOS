@@ -3,6 +3,7 @@
 #include <kunit/test.h>
 #include <linux/anon_inodes.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -46,6 +47,21 @@ struct transaction_list_test_item {
 struct transaction_contention_test_context {
 	struct transaction *transaction;
 	struct task_struct *task;
+};
+
+struct transaction_asymmetric_wait_context {
+	struct transaction_object *object;
+	struct completion started;
+	struct completion done;
+	bool found_winner;
+	int ret;
+};
+
+struct transaction_inode_wait_context {
+	struct inode *inode;
+	struct completion started;
+	struct completion done;
+	int ret;
 };
 
 enum transaction_finish_test_event {
@@ -272,6 +288,39 @@ static int transaction_abort_thread(void *data) {
 	complete(&context->done);
 
 	return 0;
+}
+
+static int transaction_asymmetric_wait_thread(void *data) {
+	struct transaction_asymmetric_wait_context *context = data;
+	struct transaction *winner;
+
+	winner = transaction_check_asymmetric_conflict(context->object, TRANSACTION_ACCESS_READ, true, &context->ret);
+	context->found_winner = winner != NULL;
+	complete(&context->started);
+	if (winner)
+		context->ret = transaction_wait_on_conflict(winner);
+	complete(&context->done);
+	return 0;
+}
+
+static int transaction_inode_wait_thread(void *data) {
+	struct transaction_inode_wait_context *context = data;
+
+	complete(&context->started);
+	context->ret = inode_permission(&nop_mnt_idmap, context->inode, MAY_READ);
+	complete(&context->done);
+	return 0;
+}
+
+static bool transaction_wait_for_task_state(struct task_struct *task, unsigned int state) {
+	unsigned int retries;
+
+	for (retries = 0; retries < 1000; retries++) {
+		if (READ_ONCE(task->__state) == state)
+			return true;
+		usleep_range(1000, 2000);
+	}
+	return false;
 }
 
 static int transaction_contention_test_init(struct kunit *test,
@@ -677,6 +726,310 @@ static void transaction_object_reuse_test(struct kunit *test) {
 
 	transaction_object_test_cleanup(&b, b_node);
 	transaction_object_test_cleanup(&a, a_node);
+}
+
+static void transaction_asymmetric_no_conflict_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction *winner;
+	struct transaction_object object;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ, NULL, &node), 0);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_FALSE(test, list_empty(&node->object_list));
+	transaction_object_test_cleanup(&owner, node);
+}
+
+static void transaction_asymmetric_writer_abort_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction *winner;
+	struct transaction_object object;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ_WRITE, NULL, &node), 0);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&node->object_list));
+	transaction_object_test_cleanup(&owner, node);
+}
+
+static void transaction_asymmetric_reader_abort_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction *winner;
+	struct transaction_object object;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ, NULL, &node), 0);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+	KUNIT_EXPECT_TRUE(test, list_empty(&node->object_list));
+	transaction_object_test_cleanup(&owner, node);
+}
+
+static void transaction_asymmetric_multiple_readers_test(struct kunit *test) {
+	struct transaction_contention_test_context first = { };
+	struct transaction_contention_test_context second = { };
+	struct txobj_thread_list_node *first_node = NULL;
+	struct txobj_thread_list_node *second_node = NULL;
+	struct transaction_object object;
+	struct transaction *winner;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &first, 100, &second, 120), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&first, &object, &original,
+							    TRANSACTION_ACCESS_READ, NULL, &first_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&second, &object, &original,
+							    TRANSACTION_ACCESS_READ, NULL, &second_node), 0);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(first.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_EQ(test, transaction_status(second.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+	KUNIT_EXPECT_TRUE(test, list_empty(&first_node->object_list));
+	KUNIT_EXPECT_TRUE(test, list_empty(&second_node->object_list));
+	transaction_object_test_cleanup(&second, second_node);
+	transaction_object_test_cleanup(&first, first_node);
+}
+
+static void transaction_asymmetric_mixed_owner_test(struct kunit *test) {
+	struct transaction_contention_test_context active = { };
+	struct transaction_contention_test_context committing = { };
+	struct txobj_thread_list_node *active_node = NULL;
+	struct txobj_thread_list_node *committing_node = NULL;
+	struct transaction_object object;
+	struct transaction *winner;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &active, 100, &committing, 120), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&active, &object, &original,
+							    TRANSACTION_ACCESS_READ, NULL, &active_node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&committing, &object, &original,
+							    TRANSACTION_ACCESS_READ, NULL, &committing_node), 0);
+	atomic_set(&committing.transaction->status, TRANSACTION_COMMITTING);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	KUNIT_EXPECT_EQ(test, transaction_status(active.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_FALSE(test, list_empty(&active_node->object_list));
+	KUNIT_EXPECT_FALSE(test, list_empty(&committing_node->object_list));
+	atomic_set(&committing.transaction->status, TRANSACTION_ACTIVE);
+	transaction_object_test_cleanup(&committing, committing_node);
+	transaction_object_test_cleanup(&active, active_node);
+}
+
+static void transaction_asymmetric_dentry_unsupported_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction *winner;
+	struct transaction_object object;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_DENTRY);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ_WRITE, NULL, &node), 0);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ACTIVE);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, owner.transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&node->object_list));
+	transaction_object_test_cleanup(&owner, node);
+}
+
+static void transaction_asymmetric_committing_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction *winner;
+	struct transaction_object object;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, 100), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ_WRITE, NULL, &node), 0);
+	atomic_set(&owner.transaction->status, TRANSACTION_COMMITTING);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, owner.transaction);
+	KUNIT_EXPECT_FALSE(test, list_empty(&node->object_list));
+	atomic_set(&owner.transaction->status, TRANSACTION_ACTIVE);
+	transaction_object_test_cleanup(&owner, node);
+}
+
+static void transaction_asymmetric_sleepable_ordinary_wins_test(struct kunit *test) {
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction_object object;
+	struct transaction *winner;
+	unsigned long original;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, current->prio), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ_WRITE, NULL, &node), 0);
+	winner = transaction_check_asymmetric_conflict(&object, TRANSACTION_ACCESS_READ, true, &ret);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(owner.transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&node->object_list));
+	transaction_object_test_cleanup(&owner, node);
+}
+
+static void transaction_asymmetric_wait_test(struct kunit *test) {
+	struct transaction_asymmetric_wait_context wait_context;
+	struct transaction_contention_test_context owner = { };
+	struct txobj_thread_list_node *node = NULL;
+	struct transaction_object object;
+	struct task_struct *waiter;
+	unsigned long original;
+	bool owner_active;
+	bool waited;
+	int ret;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_INODE);
+	KUNIT_ASSERT_EQ(test, transaction_contention_test_init(test, &owner, 0), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_test_acquire(&owner, &object, &original,
+							    TRANSACTION_ACCESS_READ_WRITE, NULL, &node), 0);
+	wait_context.object = &object;
+	wait_context.found_winner = false;
+	wait_context.ret = -EINPROGRESS;
+	init_completion(&wait_context.started);
+	init_completion(&wait_context.done);
+	waiter = kthread_run(transaction_asymmetric_wait_thread, &wait_context,
+			     "transaction-asymmetric-wait-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, waiter);
+	wait_for_completion(&wait_context.started);
+	waited = transaction_wait_for_task_state(waiter, TASK_KILLABLE);
+	owner_active = transaction_status(owner.transaction) == TRANSACTION_ACTIVE;
+	ret = end_transaction(owner.transaction);
+	wait_for_completion(&wait_context.done);
+	kthread_stop(waiter);
+	KUNIT_EXPECT_TRUE(test, wait_context.found_winner);
+	KUNIT_EXPECT_TRUE(test, waited);
+	KUNIT_EXPECT_TRUE(test, owner_active);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, wait_context.ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+	transaction_contention_cleanup(&owner);
+}
+
+static void transaction_asymmetric_inode_snapshot_test(struct kunit *test) {
+	struct _inode *contents;
+	struct _inode *shadow;
+	struct transaction *transaction;
+	struct inode *inode;
+	struct file *file;
+	umode_t old_mode = S_IFREG | 0600;
+	umode_t new_mode = S_IFREG | 0644;
+
+	file = anon_inode_create_getfile("[transaction-asymmetric-inode-test]",
+						 &transaction_test_file_operations, NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode->i_mode = old_mode;
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	contents = transaction_inode_get(inode, TRANSACTION_ACCESS_READ);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, contents);
+	KUNIT_EXPECT_EQ(test, contents->i_mode, old_mode);
+
+	transaction_detach_task(current);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_TRUE(test, list_empty(&inode->transaction_object.readers));
+	inode->i_mode = new_mode;
+	KUNIT_EXPECT_EQ(test, contents->i_mode, old_mode);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	shadow = transaction_inode_visible(inode);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, shadow);
+	KUNIT_EXPECT_EQ(test, shadow->i_mode, new_mode);
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
+static void transaction_asymmetric_inode_permission_wait_test(struct kunit *test) {
+	struct transaction_inode_wait_context wait_context;
+	struct transaction *transaction;
+	struct task_struct *owner_task;
+	struct task_struct *waiter;
+	struct inode *inode;
+	struct file *file;
+	bool waited;
+	int ret;
+
+	file = anon_inode_create_getfile("[transaction-asymmetric-permission-test]",
+						 &transaction_test_file_operations, NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode->i_mode = S_IFREG | 0644;
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	transaction_detach_task(current);
+	owner_task = kunit_kzalloc(test, sizeof(*owner_task), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, owner_task);
+	transaction_task_init(owner_task);
+	owner_task->prio = 0;
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, owner_task), 0);
+
+	wait_context.inode = inode;
+	wait_context.ret = -EINPROGRESS;
+	init_completion(&wait_context.started);
+	init_completion(&wait_context.done);
+	waiter = kthread_run(transaction_inode_wait_thread, &wait_context,
+			     "transaction-inode-permission-wait-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, waiter);
+	wait_for_completion(&wait_context.started);
+	waited = transaction_wait_for_task_state(waiter, TASK_KILLABLE);
+	ret = end_transaction(transaction);
+	wait_for_completion(&wait_context.done);
+	kthread_stop(waiter);
+	KUNIT_EXPECT_TRUE(test, waited);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, wait_context.ret, 0);
+	transaction_detach_task(owner_task);
+	transaction_put(transaction);
+	fput(file);
 }
 
 static void transaction_finish_order_test(struct kunit *test) {
@@ -1923,6 +2276,17 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_object_upgrade_test),
 	KUNIT_CASE(transaction_object_upgrade_loses_test),
 	KUNIT_CASE(transaction_object_reuse_test),
+	KUNIT_CASE(transaction_asymmetric_no_conflict_test),
+	KUNIT_CASE(transaction_asymmetric_writer_abort_test),
+	KUNIT_CASE(transaction_asymmetric_reader_abort_test),
+	KUNIT_CASE(transaction_asymmetric_multiple_readers_test),
+	KUNIT_CASE(transaction_asymmetric_mixed_owner_test),
+	KUNIT_CASE(transaction_asymmetric_dentry_unsupported_test),
+	KUNIT_CASE(transaction_asymmetric_committing_test),
+	KUNIT_CASE(transaction_asymmetric_sleepable_ordinary_wins_test),
+	KUNIT_CASE(transaction_asymmetric_wait_test),
+	KUNIT_CASE(transaction_asymmetric_inode_snapshot_test),
+	KUNIT_CASE(transaction_asymmetric_inode_permission_wait_test),
 	KUNIT_CASE(transaction_finish_order_test),
 	KUNIT_CASE(transaction_abort_before_final_commit_test),
 	// TODO: Re-enable when transaction_finish_workset() runs optional validation callbacks.
