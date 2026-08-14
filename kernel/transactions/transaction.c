@@ -437,7 +437,7 @@ bool transaction_contention_manager(struct transaction *a, struct transaction *b
 		return false;
 
 	status_a = transaction_status(a);
-	// TxOS represents an ordinary task with an inactive transaction at timestamp -1.
+	// An ordinary task has no active transaction and uses timestamp -1.
 	if (!b) {
 		if (status_a == TRANSACTION_COMMITTING) {
 			if (should_sleep)
@@ -571,6 +571,7 @@ static void terminate_transaction(struct transaction * transaction) {
  */
 static int transaction_finish_workset(struct transaction *transaction) {
 	struct txobj_thread_list_node *first_node;
+	struct txobj_thread_list_node *previous_node = NULL;
 	struct txobj_thread_list_node *node;
 	struct skiplist_head *first;
 	struct skiplist_head workset;
@@ -590,6 +591,8 @@ static int transaction_finish_workset(struct transaction *transaction) {
 
 	// Acquire blocking locks in original-object address order.
 	skiplist_for_each_entry(node, &workset, workset_list) {
+		node->ordered_lock_prev = previous_node;
+		previous_node = node;
 		if (node->lock)
 			WARN_ON_ONCE(node->lock(node, 1));
 	}
@@ -605,10 +608,7 @@ static int transaction_finish_workset(struct transaction *transaction) {
 			spin_lock_nest_lock(&node->tx_obj->lock, &first_node->tx_obj->lock);
 	}
 
-	/*
-	 * TODO: Optional validation that runs if CONFIG_TX_KSTM_ASSERTIONS was set in TxOS
-	 * transactional objects should expose a validate() function to support this feature
-	 */
+	// TODO: Enable optional validation after transactional objects expose validate().
 	// if (transaction_status(transaction) == TRANSACTION_ACTIVE) {
 	// 	skiplist_for_each_entry(node, &workset, workset_list) {
 	// 		if (!node->validate)

@@ -77,9 +77,9 @@ struct transaction {
 
 	// object_list tracks ordinary transactional objects such as files and inodes
 	struct skiplist_head object_list;
-	// list_list tracks transactional list heads separately, matching TxOS ordering:
+	// list_list tracks transactional list heads separately for finish ordering:
 	// list entries are collected separately and merged into the finished workset
-	// before normal objects are committed or aborted. 
+	// before normal objects are committed or aborted.
 	struct skiplist_head list_list;
 	spinlock_t workset_lock;
 
@@ -109,6 +109,7 @@ enum transaction_object_type {
 	TRANSACTION_OBJECT_SOCKET,
 	TRANSACTION_OBJECT_TASK,
 	TRANSACTION_OBJECT_LIST_HEAD,
+	TRANSACTION_OBJECT_HLIST_HEAD,
 	TRANSACTION_OBJECT_CUSTOM,
 };
 
@@ -139,6 +140,8 @@ struct txobj_thread_list_node {
 	void *orig_obj;
 	struct transaction_object *tx_obj;
 	enum transaction_access_mode rw;
+	// Previous workset node in final object-lock order.
+	struct txobj_thread_list_node *ordered_lock_prev;
 	/*
 	 * TODO: Optional validation may return an errno to abort before commit. The
 	 * other callbacks are expected to succeed; nonzero returns warn.

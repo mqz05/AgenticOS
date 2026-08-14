@@ -79,8 +79,9 @@ static int transaction_object_abort_conflicts_locked(struct transaction_object *
 	int ret;
 
 	lockdep_assert_held(&object->lock);
-	// Dentry relationships need transactional hlist conversion before takeover.
-	if (object->type != TRANSACTION_OBJECT_FILE && object->type != TRANSACTION_OBJECT_INODE)
+	// Only private-version objects and speculative hlists support immediate takeover.
+	if (object->type != TRANSACTION_OBJECT_FILE && object->type != TRANSACTION_OBJECT_INODE &&
+	    object->type != TRANSACTION_OBJECT_HLIST_HEAD)
 		return -EOPNOTSUPP;
 
 	// Check every owner before changing transaction or ownership state.
@@ -115,7 +116,7 @@ static int transaction_object_abort_conflicts_locked(struct transaction_object *
 		}
 	}
 
-	// Referenced committed versions preserve the readers original snapshots.
+	// Private versions or speculative logs preserve each transaction's view.
 	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
 		list_for_each_entry_safe(reader, next, &object->readers, object_list)
 			list_del_init(&reader->object_list);
