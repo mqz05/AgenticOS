@@ -86,6 +86,8 @@ struct transaction_finish_test_context {
 	int id;
 	int blocking_locks;
 	int nonblocking_locks;
+	int blocking_lock_calls;
+	int blocking_unlock_calls;
 	bool validate_locked;
 	bool validate_owned;
 	bool commit_locked;
@@ -209,6 +211,7 @@ static int transaction_finish_test_lock(struct txobj_thread_list_node *node, int
 
 	if (blocking) {
 		context->blocking_locks++;
+		context->blocking_lock_calls++;
 		transaction_finish_test_record(context, TRANSACTION_FINISH_BLOCKING_LOCK);
 	} else {
 		context->nonblocking_locks++;
@@ -223,6 +226,7 @@ static int transaction_finish_test_unlock(struct txobj_thread_list_node *node, i
 
 	if (blocking) {
 		context->blocking_locks--;
+		context->blocking_unlock_calls++;
 		transaction_finish_test_record(context, TRANSACTION_FINISH_BLOCKING_UNLOCK);
 	} else {
 		context->nonblocking_locks--;
@@ -867,6 +871,43 @@ static void transaction_asymmetric_dentry_unsupported_test(struct kunit *test) {
 	transaction_object_test_cleanup(&owner, node);
 }
 
+static void transaction_asymmetric_dentry_takeover_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct transaction *winner;
+	struct _dentry *baseline;
+	struct dentry *dentry;
+	struct inode *inode;
+	struct file *file;
+	int inode_refs;
+	int ret;
+
+	file = anon_inode_getfile("[transaction-dentry-takeover]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	dentry = file->f_path.dentry;
+	inode = d_inode(dentry);
+	inode_refs = atomic_read(&inode->i_count);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(dentry), 0);
+	baseline = transaction_dentry_visible(dentry)->shadow;
+	KUNIT_ASSERT_NOT_NULL(test, baseline);
+	transaction_detach_task(current);
+
+	spin_lock(&dentry->d_lock);
+	winner = transaction_check_asymmetric_conflict(&dentry->transaction_object,
+						       TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+	spin_unlock(&dentry->d_lock);
+	KUNIT_EXPECT_PTR_EQ(test, winner, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_PTR_NE(test, rcu_access_pointer(dentry->d_contents), baseline);
+	KUNIT_EXPECT_TRUE(test, baseline->owns_inode);
+	KUNIT_EXPECT_EQ(test, atomic_read(&inode->i_count), inode_refs + 1);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, atomic_read(&inode->i_count), inode_refs);
+	transaction_put(transaction);
+	fput(file);
+}
+
 static void transaction_asymmetric_committing_test(struct kunit *test) {
 	struct transaction_contention_test_context owner = { };
 	struct txobj_thread_list_node *node = NULL;
@@ -1067,7 +1108,10 @@ static void transaction_finish_order_test(struct kunit *test) {
 		nodes[index]->validate = transaction_finish_test_validate;
 		nodes[index]->commit = transaction_finish_test_commit;
 		nodes[index]->release = transaction_finish_test_release;
-		KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, nodes[index]), 0);
+		if (index)
+			KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, nodes[index]), 0);
+		else
+			KUNIT_ASSERT_EQ(test, transaction_list_workset_add(transaction, nodes[index]), 0);
 		KUNIT_ASSERT_EQ(test, transaction_object_acquire(transaction, nodes[index], TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
 	}
 
@@ -1086,6 +1130,47 @@ static void transaction_finish_order_test(struct kunit *test) {
 		KUNIT_EXPECT_PTR_EQ(test, objects[i].writer, NULL);
 		KUNIT_EXPECT_TRUE(test, list_empty(&objects[i].readers));
 	}
+	transaction_put(transaction);
+}
+
+static void transaction_finish_shared_blocking_lock_test(struct kunit *test) {
+	struct transaction_finish_test_context contexts[2] = { };
+	struct transaction_finish_test_log log = { };
+	struct txobj_thread_list_node *nodes[2];
+	struct transaction_object objects[2];
+	unsigned long originals[2];
+	struct transaction *transaction;
+	unsigned long shared_lock;
+	unsigned int i;
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	transaction_object_init(&objects[0], TRANSACTION_OBJECT_INODE);
+	transaction_object_init(&objects[1], TRANSACTION_OBJECT_HLIST_HEAD);
+	for (i = 0; i < ARRAY_SIZE(nodes); i++) {
+		contexts[i].log = &log;
+		contexts[i].object = &objects[i];
+		contexts[i].transaction = transaction;
+		contexts[i].id = i;
+		nodes[i] = transaction_workset_node_alloc(&contexts[i], &originals[i], &objects[i], objects[i].type,
+						     TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, nodes[i]);
+		nodes[i]->lock = transaction_finish_test_lock;
+		nodes[i]->unlock = transaction_finish_test_unlock;
+		nodes[i]->blocking_lock_id = &shared_lock;
+		if (i)
+			KUNIT_ASSERT_EQ(test, transaction_list_workset_add(transaction, nodes[i]), 0);
+		else
+			KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, nodes[i]), 0);
+		KUNIT_ASSERT_EQ(test, transaction_object_acquire(transaction, nodes[i],
+							 TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
+	}
+
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, contexts[0].blocking_lock_calls + contexts[1].blocking_lock_calls, 1);
+	KUNIT_EXPECT_EQ(test, contexts[0].blocking_unlock_calls + contexts[1].blocking_unlock_calls, 1);
+	KUNIT_EXPECT_EQ(test, contexts[0].blocking_locks + contexts[1].blocking_locks, 0);
 	transaction_put(transaction);
 }
 
@@ -2019,6 +2104,7 @@ static void transaction_dentry_external_name_test(struct kunit *test) {
 	static const char new_name[] = "transaction-dentry-new-name-that-does-not-fit-inline-storage";
 	struct transaction *transaction;
 	struct dentry *dentry;
+	struct dentry *found;
 	struct dentry *parent;
 	struct dentry *target;
 	struct inode *inode;
@@ -2042,7 +2128,12 @@ static void transaction_dentry_external_name_test(struct kunit *test) {
 
 	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
 	d_move(dentry, target);
-	KUNIT_EXPECT_STREQ(test, (const char *)dentry->d_name.name, new_name);
+	KUNIT_ASSERT_NOT_NULL(test, transaction_dentry_visible(dentry));
+	KUNIT_EXPECT_STREQ(test, (const char *)transaction_dentry_visible(dentry)->d_name.name, new_name);
+	KUNIT_EXPECT_STREQ(test, (const char *)dentry->d_name.name, old_name);
+	found = d_lookup(parent, &target->d_name);
+	KUNIT_EXPECT_PTR_EQ(test, found, dentry);
+	dput(found);
 	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
 	KUNIT_EXPECT_STREQ(test, (const char *)dentry->d_name.name, old_name);
@@ -2052,50 +2143,41 @@ static void transaction_dentry_external_name_test(struct kunit *test) {
 	fput(file);
 }
 
-static void transaction_hlist_restore_test(struct kunit *test) {
-	struct tx_hlist_node_snapshot snapshot;
-	struct hlist_head head;
-	struct hlist_node first;
-	struct hlist_node second;
+static void transaction_dentry_repeated_inode_abort_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct _dentry *shadow;
+	struct dentry *child;
+	struct inode *inode;
+	struct file *file;
+	struct qstr name = QSTR_INIT("tx-repeated-inode", 17);
+	int count;
 
-	INIT_HLIST_HEAD(&head);
-	INIT_HLIST_NODE(&first);
-	INIT_HLIST_NODE(&second);
-	hlist_add_head(&first, &head);
-	hlist_add_head(&second, &head);
+	file = anon_inode_getfile("[transaction-dentry-inode-test]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	child = d_alloc(file->f_path.dentry, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+	count = atomic_read(&inode->i_count);
 
-	tx_hlist_snapshot(&second, &snapshot);
-	hlist_del_init(&second);
-	KUNIT_EXPECT_PTR_EQ(test, head.first, &first);
-
-	tx_hlist_restore(&second, &snapshot);
-	KUNIT_EXPECT_PTR_EQ(test, head.first, &second);
-	KUNIT_EXPECT_PTR_EQ(test, second.next, &first);
-	KUNIT_EXPECT_PTR_EQ(test, first.pprev, &second.next);
-}
-
-static void transaction_hlist_bl_restore_test(struct kunit *test) {
-	struct tx_hlist_bl_node_snapshot snapshot;
-	struct hlist_bl_head head;
-	struct hlist_bl_node first;
-	struct hlist_bl_node second;
-
-	INIT_HLIST_BL_HEAD(&head);
-	INIT_HLIST_BL_NODE(&first);
-	INIT_HLIST_BL_NODE(&second);
-	hlist_bl_lock(&head);
-	hlist_bl_add_head(&first, &head);
-	hlist_bl_add_head(&second, &head);
-
-	tx_hlist_bl_snapshot(&second, &snapshot);
-	hlist_bl_del_init(&second);
-	KUNIT_EXPECT_PTR_EQ(test, hlist_bl_first(&head), &first);
-
-	tx_hlist_bl_restore(&second, &snapshot);
-	KUNIT_EXPECT_PTR_EQ(test, hlist_bl_first(&head), &second);
-	KUNIT_EXPECT_PTR_EQ(test, second.next, &first);
-	KUNIT_EXPECT_PTR_EQ(test, first.pprev, &second.next);
-	hlist_bl_unlock(&head);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_dentry_snapshot(child), 0);
+	shadow = transaction_dentry_shadow(child);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, shadow);
+	KUNIT_ASSERT_NOT_NULL(test, igrab(inode));
+	KUNIT_ASSERT_EQ(test, transaction_dentry_record_inode_change(child, NULL, inode), 0);
+	shadow->d_inode = inode;
+	KUNIT_ASSERT_EQ(test, transaction_dentry_record_inode_change(child, inode, NULL), 0);
+	shadow->d_inode = NULL;
+	KUNIT_ASSERT_NOT_NULL(test, igrab(inode));
+	KUNIT_ASSERT_EQ(test, transaction_dentry_record_inode_change(child, NULL, inode), 0);
+	shadow->d_inode = inode;
+	KUNIT_EXPECT_EQ(test, atomic_read(&inode->i_count), count + 2);
+	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_EQ(test, atomic_read(&inode->i_count), count);
+	dput(child);
+	fput(file);
 }
 
 static void transaction_dentry_sibling_abort_test(struct kunit *test) {
@@ -2117,7 +2199,8 @@ static void transaction_dentry_sibling_abort_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	child = d_alloc(parent, &name);
 	KUNIT_ASSERT_NOT_NULL(test, child);
-	KUNIT_EXPECT_FALSE(test, hlist_unhashed(&child->d_sib));
+	KUNIT_EXPECT_TRUE(test, hlist_unhashed(&child->d_sib));
+	KUNIT_EXPECT_FALSE(test, tx_hlist_visible_unhashed(&child->d_sib_tx));
 
 	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
@@ -2130,10 +2213,34 @@ static void transaction_dentry_sibling_abort_test(struct kunit *test) {
 	fput(file);
 }
 
+static void transaction_dentry_sibling_commit_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *parent;
+	struct dentry *child;
+	struct file *file;
+	struct qstr name = QSTR_INIT("txchild-commit", 14);
+
+	file = anon_inode_getfile("[transaction-dcache-test]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	parent = file->f_path.dentry;
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	child = d_alloc(parent, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+	KUNIT_EXPECT_TRUE(test, hlist_unhashed(&child->d_sib));
+	KUNIT_EXPECT_FALSE(test, tx_hlist_visible_unhashed(&child->d_sib_tx));
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_FALSE(test, hlist_unhashed(&child->d_sib));
+	KUNIT_EXPECT_PTR_EQ(test, child->d_parent, parent);
+	dput(child);
+	fput(file);
+}
+
 static void transaction_dentry_hash_abort_test(struct kunit *test) {
 	struct transaction *transaction;
 	struct dentry *parent;
 	struct dentry *child;
+	struct dentry *found;
 	struct file *file;
 	struct qstr name = QSTR_INIT("txhash", 6);
 
@@ -2152,12 +2259,123 @@ static void transaction_dentry_hash_abort_test(struct kunit *test) {
 	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
 	d_rehash(child);
 	KUNIT_EXPECT_FALSE(test, d_unhashed(child));
+	found = d_lookup(parent, &name);
+	KUNIT_EXPECT_PTR_EQ(test, found, child);
+	dput(found);
 
 	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
 	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
 	KUNIT_EXPECT_TRUE(test, d_unhashed(child));
 
 	transaction_detach_task(current);
+	transaction_put(transaction);
+	found = d_lookup(parent, &name);
+	KUNIT_EXPECT_PTR_EQ(test, found, NULL);
+	dput(child);
+	fput(file);
+}
+
+static void transaction_dentry_hash_commit_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *parent;
+	struct dentry *child;
+	struct dentry *found;
+	struct file *file;
+	struct qstr name = QSTR_INIT("txhash-commit", 13);
+
+	file = anon_inode_getfile("[transaction-dcache-test]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	parent = file->f_path.dentry;
+	child = d_alloc(parent, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	d_rehash(child);
+	KUNIT_EXPECT_TRUE(test, hlist_bl_unhashed(&child->d_hash));
+	found = d_lookup(parent, &name);
+	KUNIT_EXPECT_PTR_EQ(test, found, child);
+	dput(found);
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_FALSE(test, hlist_bl_unhashed(&child->d_hash));
+	found = d_lookup(parent, &name);
+	KUNIT_EXPECT_PTR_EQ(test, found, child);
+	dput(found);
+	d_drop(child);
+	dput(child);
+	fput(file);
+}
+
+static void transaction_dentry_alias_abort_commit_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *alias;
+	struct dentry *child;
+	struct inode *held;
+	struct inode *inode;
+	struct file *file;
+	struct qstr name = QSTR_INIT("txalias", 7);
+
+	file = anon_inode_getfile("[transaction-dcache-test]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	child = d_alloc(file->f_path.dentry, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	held = igrab(inode);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	d_instantiate(child, held);
+	KUNIT_EXPECT_PTR_EQ(test, d_inode(child), inode);
+	KUNIT_EXPECT_PTR_EQ(test, child->d_inode, NULL);
+	KUNIT_EXPECT_TRUE(test, hlist_unhashed(&child->d_u.d_alias));
+	alias = d_find_any_alias(inode);
+	KUNIT_EXPECT_PTR_EQ(test, alias, child);
+	dput(alias);
+	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_PTR_EQ(test, child->d_inode, NULL);
+	KUNIT_EXPECT_TRUE(test, hlist_unhashed(&child->d_u.d_alias));
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	held = igrab(inode);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	d_instantiate(child, held);
+	KUNIT_ASSERT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+	KUNIT_EXPECT_PTR_EQ(test, child->d_inode, inode);
+	KUNIT_EXPECT_FALSE(test, hlist_unhashed(&child->d_u.d_alias));
+
+	dput(child);
+	fput(file);
+}
+
+static void transaction_dentry_hash_takeover_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct dentry *child;
+	struct file *file;
+	struct qstr name = QSTR_INIT("txtakeover", 10);
+
+	file = anon_inode_getfile("[transaction-dcache-test]", &transaction_test_file_operations, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	child = d_alloc(file->f_path.dentry, &name);
+	KUNIT_ASSERT_NOT_NULL(test, child);
+	d_rehash(child);
+	KUNIT_ASSERT_FALSE(test, hlist_bl_unhashed(&child->d_hash));
+
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	d_drop(child);
+	KUNIT_EXPECT_TRUE(test, d_unhashed(child));
+	KUNIT_EXPECT_FALSE(test, hlist_bl_unhashed(&child->d_hash));
+	transaction_detach_task(current);
+
+	spin_lock(&child->d_lock);
+	__d_drop(child);
+	spin_unlock(&child->d_lock);
+	KUNIT_EXPECT_EQ(test, transaction_status(transaction), TRANSACTION_ABORTED);
+	KUNIT_EXPECT_TRUE(test, hlist_bl_unhashed(&child->d_hash));
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
 	transaction_put(transaction);
 	dput(child);
 	fput(file);
@@ -2256,10 +2474,13 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_dentry_read_version_test),
 	KUNIT_CASE(transaction_dentry_refresh_committed_test),
 	KUNIT_CASE(transaction_dentry_external_name_test),
-	KUNIT_CASE(transaction_hlist_restore_test),
-	KUNIT_CASE(transaction_hlist_bl_restore_test),
+	KUNIT_CASE(transaction_dentry_repeated_inode_abort_test),
 	KUNIT_CASE(transaction_dentry_sibling_abort_test),
+	KUNIT_CASE(transaction_dentry_sibling_commit_test),
 	KUNIT_CASE(transaction_dentry_hash_abort_test),
+	KUNIT_CASE(transaction_dentry_hash_commit_test),
+	KUNIT_CASE(transaction_dentry_alias_abort_commit_test),
+	KUNIT_CASE(transaction_dentry_hash_takeover_test),
 	KUNIT_CASE(transaction_syscall_commit_test),
 	KUNIT_CASE(transaction_syscall_abort_test),
 	KUNIT_CASE(transaction_live_fork_test),
@@ -2282,12 +2503,14 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_asymmetric_multiple_readers_test),
 	KUNIT_CASE(transaction_asymmetric_mixed_owner_test),
 	KUNIT_CASE(transaction_asymmetric_dentry_unsupported_test),
+	KUNIT_CASE(transaction_asymmetric_dentry_takeover_test),
 	KUNIT_CASE(transaction_asymmetric_committing_test),
 	KUNIT_CASE(transaction_asymmetric_sleepable_ordinary_wins_test),
 	KUNIT_CASE(transaction_asymmetric_wait_test),
 	KUNIT_CASE(transaction_asymmetric_inode_snapshot_test),
 	KUNIT_CASE(transaction_asymmetric_inode_permission_wait_test),
 	KUNIT_CASE(transaction_finish_order_test),
+	KUNIT_CASE(transaction_finish_shared_blocking_lock_test),
 	KUNIT_CASE(transaction_abort_before_final_commit_test),
 	// TODO: Re-enable when transaction_finish_workset() runs optional validation callbacks.
 	// KUNIT_CASE(transaction_validation_failure_test),

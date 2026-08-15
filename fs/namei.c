@@ -2551,6 +2551,10 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 	int error;
 	const char *s = nd->pathname;
 
+	// Transactional lookup needs referenced dentry and inode versions.
+	if (current_transaction())
+		flags &= ~LOOKUP_RCU;
+
 	/* LOOKUP_CACHED requires RCU, ask caller to retry */
 	if ((flags & (LOOKUP_RCU | LOOKUP_CACHED)) == LOOKUP_CACHED)
 		return ERR_PTR(-EAGAIN);
@@ -4546,6 +4550,7 @@ SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
 int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 		     struct dentry *dentry)
 {
+	struct inode *target = d_inode(dentry);
 	int error = may_delete(idmap, dir, dentry, 1);
 
 	if (error)
@@ -4555,11 +4560,11 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 		return -EPERM;
 
 	dget(dentry);
-	inode_lock(dentry->d_inode);
+	inode_lock(target);
 
 	error = -EBUSY;
 	if (is_local_mountpoint(dentry) ||
-	    (inode_get_flags(dentry->d_inode) & S_KERNEL_FILE))
+	    (inode_get_flags(target) & S_KERNEL_FILE))
 		goto out;
 
 	error = security_inode_rmdir(dir, dentry);
@@ -4569,7 +4574,7 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 	error = transaction_inode_snapshot(dir);
 	if (error)
 		goto out;
-	error = transaction_inode_snapshot(dentry->d_inode);
+	error = transaction_inode_snapshot(target);
 	if (error)
 		goto out;
 	if (current_transaction() && d_unhashed(dentry))
@@ -4582,12 +4587,12 @@ int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 		goto out;
 
 	shrink_dcache_parent(dentry);
-	inode_set_flags(dentry->d_inode, S_DEAD, S_DEAD);
+	inode_set_flags(target, S_DEAD, S_DEAD);
 	dont_mount(dentry);
 	detach_mounts(dentry);
 
 out:
-	inode_unlock(dentry->d_inode);
+	inode_unlock(target);
 	dput(dentry);
 	if (!error)
 		d_delete_notify(dir, dentry);
@@ -4682,7 +4687,7 @@ SYSCALL_DEFINE1(rmdir, const char __user *, pathname)
 int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
 	       struct dentry *dentry, struct inode **delegated_inode)
 {
-	struct inode *target = dentry->d_inode;
+	struct inode *target = d_inode(dentry);
 	int error = may_delete(idmap, dir, dentry, 0);
 
 	if (error)

@@ -143,23 +143,48 @@ static struct dentry *scan_positives(struct dentry *cursor,
 	return found;
 }
 
+static inline loff_t dcache_transaction_file_get_pos(struct file *file) {
+#ifdef CONFIG_TRANSACTIONS
+	return transaction_file_get_pos(file);
+#else
+	return file->f_pos;
+#endif
+}
+
+static inline int dcache_transaction_file_set_pos(struct file *file, loff_t pos) {
+#ifdef CONFIG_TRANSACTIONS
+	return transaction_file_set_pos(file, pos);
+#else
+	file->f_pos = pos;
+	return 0;
+#endif
+}
+
 loff_t dcache_dir_lseek(struct file *file, loff_t offset, int whence)
 {
 	struct dentry *dentry = file->f_path.dentry;
+	loff_t current_pos = dcache_transaction_file_get_pos(file);
+
 	switch (whence) {
-		case 1:
-			offset += file->f_pos;
-			fallthrough;
-		case 0:
-			if (offset >= 0)
-				break;
-			fallthrough;
-		default:
-			return -EINVAL;
+	case 1:
+		offset += current_pos;
+		fallthrough;
+	case 0:
+		if (offset >= 0)
+			break;
+		fallthrough;
+	default:
+		return -EINVAL;
 	}
-	if (offset != file->f_pos) {
+	if (offset != current_pos) {
 		struct dentry *cursor = file->private_data;
 		struct dentry *to = NULL;
+
+		if (current_transaction()) {
+			int ret = dcache_transaction_file_set_pos(file, offset);
+
+			return ret ? ret : offset;
+		}
 
 		inode_lock_shared(dentry->d_inode);
 
@@ -187,6 +212,78 @@ EXPORT_SYMBOL(dcache_dir_lseek);
  * both impossible due to the lock on directory.
  */
 
+#ifdef CONFIG_TRANSACTIONS
+static struct dentry *dcache_transaction_child_at(struct dentry *parent, loff_t offset) {
+	struct dentry *child;
+	loff_t index = 0;
+
+	spin_lock(&parent->d_lock);
+	for (child = d_first_child(parent); child; child = d_next_sibling(child)) {
+		bool positive;
+
+		if (child->d_flags & DCACHE_DENTRY_CURSOR || !simple_positive(child))
+			continue;
+		if (index++ != offset)
+			continue;
+		spin_lock_nested(&child->d_lock, DENTRY_D_LOCK_NESTED);
+		positive = simple_positive(child);
+		if (positive)
+			dget_dlock(child);
+		spin_unlock(&child->d_lock);
+		if (positive) {
+			spin_unlock(&parent->d_lock);
+			return child;
+		}
+		index--;
+	}
+	spin_unlock(&parent->d_lock);
+	return NULL;
+}
+
+// Rebuild the native cursor after a committed transactional directory position.
+static void dcache_transaction_align_cursor(struct dentry *parent, struct dentry *cursor, loff_t pos) {
+	struct dentry *previous;
+
+	if (pos <= 2)
+		return;
+	previous = scan_positives(cursor, &parent->d_children.first, pos - 2, NULL);
+	spin_lock(&parent->d_lock);
+	hlist_del_init(&cursor->d_sib);
+	if (previous)
+		hlist_add_behind(&cursor->d_sib, &previous->d_sib);
+	spin_unlock(&parent->d_lock);
+	dput(previous);
+}
+
+static int dcache_readdir_transaction(struct file *file, struct dir_context *ctx) {
+	struct dentry *parent = file->f_path.dentry;
+
+	while (ctx->pos >= 2) {
+		struct _dentry *contents;
+		struct dentry *child;
+		struct inode *inode;
+
+		child = dcache_transaction_child_at(parent, ctx->pos - 2);
+		if (!child)
+			return 0;
+		contents = transaction_dentry_get(child, TRANSACTION_ACCESS_READ);
+		if (IS_ERR(contents)) {
+			dput(child);
+			return PTR_ERR(contents);
+		}
+		inode = contents->d_inode;
+		if (!inode || !dir_emit(ctx, contents->d_name.name, contents->d_name.len, inode->i_ino,
+					 fs_umode_to_dtype(inode_get_mode(inode)))) {
+			dput(child);
+			return 0;
+		}
+		dput(child);
+		ctx->pos++;
+	}
+	return 0;
+}
+#endif
+
 int dcache_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct dentry *dentry = file->f_path.dentry;
@@ -194,8 +291,21 @@ int dcache_readdir(struct file *file, struct dir_context *ctx)
 	struct dentry *next = NULL;
 	struct hlist_node **p;
 
+#ifdef CONFIG_TRANSACTIONS
+	if (current_transaction()) {
+		struct _dentry *contents = transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ);
+
+		if (IS_ERR(contents))
+			return PTR_ERR(contents);
+	}
+#endif
 	if (!dir_emit_dots(file, ctx))
 		return 0;
+#ifdef CONFIG_TRANSACTIONS
+	if (current_transaction())
+		return dcache_readdir_transaction(file, ctx);
+	dcache_transaction_align_cursor(dentry, cursor, ctx->pos);
+#endif
 
 	if (ctx->pos == 2)
 		p = &dentry->d_children.first;
@@ -458,7 +568,7 @@ static struct dentry *find_positive_dentry(struct dentry *parent,
 		dentry = d_next_sibling(dentry);
 	else if (!dentry)
 		dentry = d_first_child(parent);
-	hlist_for_each_entry_from(dentry, d_sib) {
+	for (; dentry; dentry = d_next_sibling(dentry)) {
 		if (!simple_positive(dentry))
 			continue;
 		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
@@ -578,7 +688,7 @@ struct dentry *find_next_child(struct dentry *parent, struct dentry *prev)
 
 	spin_lock(&parent->d_lock);
 	d = prev ? d_next_sibling(prev) : d_first_child(parent);
-	hlist_for_each_entry_from(d, d_sib) {
+	for (; d; d = d_next_sibling(d)) {
 		if (simple_positive(d)) {
 			spin_lock_nested(&d->d_lock, DENTRY_D_LOCK_NESTED);
 			if (simple_positive(d))
@@ -755,7 +865,7 @@ int simple_empty(struct dentry *dentry)
 	int ret = 0;
 
 	spin_lock(&dentry->d_lock);
-	hlist_for_each_entry(child, &dentry->d_children, d_sib) {
+	for (child = d_first_child(dentry); child; child = d_next_sibling(child)) {
 		spin_lock_nested(&child->d_lock, DENTRY_D_LOCK_NESTED);
 		if (simple_positive(child)) {
 			spin_unlock(&child->d_lock);

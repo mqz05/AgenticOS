@@ -55,6 +55,28 @@ static struct _inode *transaction_inode_committed_locked(struct inode *inode) {
 	return contents;
 }
 
+int transaction_inode_replace_committed_locked(struct transaction_object *object) {
+	struct inode *inode = container_of(object, struct inode, transaction_object);
+	struct _inode *committed;
+	struct _inode *replacement;
+
+	lockdep_assert_held(&inode->i_lock);
+	committed = transaction_inode_committed_locked(inode);
+	replacement = kmalloc(sizeof(*replacement), GFP_ATOMIC);
+	if (!replacement)
+		return -ENOMEM;
+	memcpy(replacement, committed, sizeof(*replacement));
+	replacement->parent = inode;
+	replacement->shadow = NULL;
+	refcount_set(&replacement->tx_refcount, 1);
+	memset(&replacement->i_rcu, 0, sizeof(replacement->i_rcu));
+	replacement->embedded = false;
+	rcu_assign_pointer(inode->i_contents, replacement);
+	transaction_inode_contents_put(committed);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_inode_replace_committed_locked);
+
 static void transaction_inode_shadow_copy(struct _inode *shadow_inode,
 					  struct _inode *committed) {
 	memcpy(shadow_inode, committed, sizeof(*shadow_inode));
@@ -89,6 +111,7 @@ static void transaction_inode_private_put(struct _inode *shadow_inode) {
 /* Initialize the generic transaction object embedded in struct inode. */
 void transaction_inode_init(struct inode *inode) {
 	transaction_object_init(&inode->transaction_object, TRANSACTION_OBJECT_INODE);
+	inode->transaction_object.replace_committed = transaction_inode_replace_committed_locked;
 	RCU_INIT_POINTER(inode->i_contents, NULL);
 	memset(&inode->i_committed, 0, sizeof(inode->i_committed));
 }
@@ -106,7 +129,22 @@ EXPORT_SYMBOL_GPL(transaction_inode_destroy);
 
 static int transaction_inode_lock(struct txobj_thread_list_node *node, int blocking) {
 	struct inode *inode = node->orig_obj;
+	struct txobj_thread_list_node *previous;
 
+	for (previous = node->ordered_lock_prev; previous; previous = previous->ordered_lock_prev) {
+		if (previous->type != TRANSACTION_OBJECT_INODE)
+			continue;
+		if (blocking && previous->blocking_lock_acquired) {
+			struct inode *nest = previous->orig_obj;
+
+			down_write_nest_lock(&inode->i_rwsem, &nest->i_rwsem);
+			return 0;
+		}
+		if (!blocking && previous->nonblocking_lock_acquired && previous->nonblocking_nest_lock) {
+			spin_lock_nest_lock(&inode->i_lock, previous->nonblocking_nest_lock);
+			return 0;
+		}
+	}
 	if (blocking)
 		inode_lock(inode);
 	else
@@ -198,11 +236,16 @@ static int transaction_inode_release(struct txobj_thread_list_node *node, int ea
 }
 
 static void transaction_inode_setup_node(struct txobj_thread_list_node *node) {
+	struct inode *inode = node->orig_obj;
+
 	node->lock = transaction_inode_lock;
 	node->unlock = transaction_inode_unlock;
 	node->commit = transaction_inode_commit;
 	node->abort = transaction_inode_abort;
 	node->release = transaction_inode_release;
+	node->blocking_lock_id = &inode->i_rwsem;
+	node->nonblocking_lock_id = &inode->i_lock;
+	node->nonblocking_nest_lock = &inode->i_lock;
 }
 
 static struct _inode *transaction_inode_acquire_version(struct inode *inode,
@@ -229,8 +272,7 @@ retry:
 		committed->embedded = true;
 		rcu_assign_pointer(inode->i_contents, committed);
 	} else if (!transaction_inode_matches_stable(committed, inode)) {
-		/* Ordinary updates make the stable inode the next committed baseline. */
-		/* TODO: Asymmetric conflicts must serialize this with active owners. */
+		// Ordinary updates make the stable inode the next committed baseline.
 		if (!candidate) {
 			spin_unlock(&inode->i_lock);
 			candidate = kmalloc(sizeof(*candidate), GFP_KERNEL);
@@ -437,8 +479,10 @@ int transaction_inode_read(struct inode *inode) {
 		return -EINVAL;
 	if (!current_transaction()) {
 		for (;;) {
+			spin_lock(&inode->i_lock);
 			winner = transaction_check_asymmetric_conflict(&inode->transaction_object,
-									       TRANSACTION_ACCESS_READ, true, &ret);
+								       TRANSACTION_ACCESS_READ, true, &ret);
+			spin_unlock(&inode->i_lock);
 			if (!winner)
 				return ret;
 			ret = transaction_wait_on_conflict(winner);
@@ -460,8 +504,10 @@ int transaction_inode_snapshot(struct inode *inode) {
 	if (!inode)
 		return -EINVAL;
 	if (!current_transaction()) {
+		spin_lock(&inode->i_lock);
 		winner = transaction_check_asymmetric_conflict(&inode->transaction_object,
 								       TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+		spin_unlock(&inode->i_lock);
 		if (WARN_ON_ONCE(winner)) {
 			transaction_put(winner);
 			return -EUCLEAN;

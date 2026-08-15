@@ -29,6 +29,16 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_TRANSACTIONS
+static void inode_dentry_get(void *owner) {
+	ihold(owner);
+}
+
+static void inode_dentry_put(void *owner) {
+	iput(owner);
+}
+#endif
+
 /*
  * Inode locking rules:
  *
@@ -294,7 +304,20 @@ int inode_init_always_gfp(struct super_block *sb, struct inode *inode, gfp_t gfp
 		mapping_set_stable_writes(mapping);
 	inode->i_private = NULL;
 	inode->i_mapping = mapping;
+#ifdef CONFIG_TRANSACTIONS
+	{
+		struct tx_hlist_head_callbacks callbacks = {
+			.owner = inode,
+			.get = inode_dentry_get,
+			.put = inode_dentry_put,
+		};
+
+		tx_hlist_head_init(&inode->i_dentry_tx, &inode->i_lock);
+		WARN_ON(tx_hlist_head_set_callbacks(&inode->i_dentry_tx, &callbacks));
+	}
+#else
 	INIT_HLIST_HEAD(&inode->i_dentry);	/* buggered by rcu freeing */
+#endif
 #ifdef CONFIG_FS_POSIX_ACL
 	inode->i_acl = inode->i_default_acl = ACL_NOT_CACHED;
 #endif

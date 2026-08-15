@@ -4,20 +4,37 @@
 #include <linux/dcache.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/transaction.h>
-#include <linux/tx_hlist.h>
 
 #define TRANSACTION_DENTRY_FLAGS (DCACHE_DISCONNECTED | DCACHE_CANT_MOUNT | \
-				  				  DCACHE_NFSFS_RENAMED | DCACHE_NEED_AUTOMOUNT | \
-				 				  DCACHE_ENTRY_TYPE | DCACHE_NOKEY_NAME)
+				  DCACHE_NFSFS_RENAMED | DCACHE_NEED_AUTOMOUNT | \
+				  DCACHE_ENTRY_TYPE | DCACHE_NOKEY_NAME)
 
-struct transaction_dentry_relations {
-	bool restore_unlink_pin;
-	struct tx_hlist_bl_node_snapshot d_hash;
-	struct tx_hlist_node_snapshot d_sib;
-	struct tx_hlist_node_snapshot d_alias;
+struct transaction_dentry_iput {
+	struct list_head list;
+	struct inode *inode;
 };
+
+struct transaction_dentry_private {
+	struct _dentry contents;
+	struct inode *commit_iput;
+	struct inode *abort_iput;
+	struct list_head deferred_iputs;
+	bool published;
+};
+
+static struct transaction_dentry_private *transaction_dentry_private(struct _dentry *contents) {
+	return container_of(contents, struct transaction_dentry_private, contents);
+}
+
+static void transaction_dentry_private_init(struct transaction_dentry_private *private) {
+	private->commit_iput = NULL;
+	private->abort_iput = NULL;
+	INIT_LIST_HEAD(&private->deferred_iputs);
+	private->published = false;
+}
 
 static void transaction_dentry_contents_free(struct rcu_head *rcu) {
 	struct _dentry *dentry = container_of(rcu, struct _dentry, d_rcu);
@@ -29,6 +46,8 @@ static void transaction_dentry_contents_put(struct _dentry *dentry) {
 	if (!dentry || !refcount_dec_and_test(&dentry->tx_refcount))
 		return;
 	transaction_dentry_name_put(dentry);
+	if (dentry->owns_inode)
+		iput(dentry->d_inode);
 	if (!dentry->embedded)
 		call_rcu(&dentry->d_rcu, transaction_dentry_contents_free);
 }
@@ -47,7 +66,7 @@ static void transaction_dentry_copy_from_stable(struct _dentry *contents, struct
 	transaction_dentry_copy_name_from_stable(contents, dentry);
 	contents->d_time = dentry->d_time;
 	contents->d_op = dentry->d_op;
-	contents->relations = NULL;
+	contents->owns_inode = false;
 }
 
 static void transaction_dentry_shadow_copy(struct _dentry *shadow,
@@ -59,7 +78,7 @@ static void transaction_dentry_shadow_copy(struct _dentry *shadow,
 	refcount_set(&shadow->tx_refcount, 1);
 	memset(&shadow->d_rcu, 0, sizeof(shadow->d_rcu));
 	shadow->embedded = false;
-	shadow->relations = NULL;
+	shadow->owns_inode = false;
 }
 
 static bool transaction_dentry_name_matches(struct _dentry *contents, struct dentry *dentry) {
@@ -91,19 +110,37 @@ static struct _dentry *transaction_dentry_committed_locked(struct dentry *dentry
 	return contents;
 }
 
-static void transaction_dentry_capture_relations(struct _dentry *shadow, struct dentry *dentry) {
-	struct transaction_dentry_relations *relations = shadow->relations;
+int transaction_dentry_replace_committed_locked(struct transaction_object *object) {
+	struct dentry *dentry = container_of(object, struct dentry, transaction_object);
+	struct _dentry *committed;
+	struct _dentry *replacement;
 
-	tx_hlist_bl_snapshot(&dentry->d_hash, &relations->d_hash);
-	tx_hlist_snapshot(&dentry->d_sib, &relations->d_sib);
-	tx_hlist_snapshot(&dentry->d_u.d_alias, &relations->d_alias);
+	lockdep_assert_held(&dentry->d_lock);
+	committed = transaction_dentry_committed_locked(dentry);
+	replacement = kmalloc(sizeof(*replacement), GFP_ATOMIC);
+	if (!replacement)
+		return -ENOMEM;
+	memcpy(replacement, committed, sizeof(*replacement));
+	transaction_dentry_name_copy(replacement, committed);
+	replacement->parent = dentry;
+	replacement->shadow = NULL;
+	refcount_set(&replacement->tx_refcount, 1);
+	memset(&replacement->d_rcu, 0, sizeof(replacement->d_rcu));
+	replacement->embedded = false;
+	replacement->owns_inode = false;
+	if (committed->d_inode && !committed->owns_inode && refcount_read(&committed->tx_refcount) > 1) {
+		ihold(committed->d_inode);
+		committed->owns_inode = true;
+	}
+	rcu_assign_pointer(dentry->d_contents, replacement);
+	transaction_dentry_contents_put(committed);
+	return 0;
 }
+EXPORT_SYMBOL_GPL(transaction_dentry_replace_committed_locked);
 
 static void transaction_dentry_private_put(struct _dentry *shadow) {
 	if (!shadow)
 		return;
-	kfree(shadow->relations);
-	shadow->relations = NULL;
 	transaction_dentry_contents_put(shadow->shadow);
 	shadow->shadow = NULL;
 	transaction_dentry_contents_put(shadow);
@@ -111,6 +148,8 @@ static void transaction_dentry_private_put(struct _dentry *shadow) {
 
 void transaction_dentry_init(struct dentry *dentry) {
 	transaction_object_init(&dentry->transaction_object, TRANSACTION_OBJECT_DENTRY);
+	dentry->transaction_object.replace_committed = transaction_dentry_replace_committed_locked;
+	dentry->transaction_publish_active = false;
 	RCU_INIT_POINTER(dentry->d_contents, NULL);
 	memset(&dentry->d_committed, 0, sizeof(dentry->d_committed));
 }
@@ -128,36 +167,32 @@ EXPORT_SYMBOL_GPL(transaction_dentry_destroy);
 
 static int transaction_dentry_lock(struct txobj_thread_list_node *node, int blocking) {
 	struct dentry *dentry = node->orig_obj;
+	struct txobj_thread_list_node *previous;
 
-	if (!blocking)
+	if (!blocking) {
+		for (previous = node->ordered_lock_prev; previous; previous = previous->ordered_lock_prev) {
+			if (previous->nonblocking_lock_acquired && previous->nonblocking_nest_lock) {
+				spin_lock_nest_lock(&dentry->d_lock, previous->nonblocking_nest_lock);
+				goto locked;
+			}
+		}
 		spin_lock(&dentry->d_lock);
+locked:
+		raw_write_seqcount_begin(&dentry->d_seq);
+		dentry->transaction_publish_active = true;
+	}
 	return 0;
 }
 
 static int transaction_dentry_unlock(struct txobj_thread_list_node *node, int blocking) {
 	struct dentry *dentry = node->orig_obj;
 
-	if (!blocking)
+	if (!blocking) {
+		raw_write_seqcount_end(&dentry->d_seq);
+		dentry->transaction_publish_active = false;
 		spin_unlock(&dentry->d_lock);
+	}
 	return 0;
-}
-
-static void transaction_dentry_restore_relations(struct _dentry *shadow, struct dentry *dentry) {
-	struct transaction_dentry_relations *relations = shadow->relations;
-	struct _dentry *baseline = shadow->shadow;
-
-	if (!relations)
-		return;
-	raw_write_seqcount_begin(&dentry->d_seq);
-	transaction_dentry_name_restore(dentry, baseline);
-	WRITE_ONCE(dentry->d_inode, baseline->d_inode);
-	WRITE_ONCE(dentry->d_parent, baseline->d_parent);
-	raw_write_seqcount_end(&dentry->d_seq);
-	tx_hlist_bl_restore(&dentry->d_hash, &relations->d_hash);
-	tx_hlist_restore(&dentry->d_sib, &relations->d_sib);
-	tx_hlist_restore(&dentry->d_u.d_alias, &relations->d_alias);
-	if (relations->restore_unlink_pin)
-		dget_dlock(dentry);
 }
 
 static void transaction_dentry_finish_metadata(struct _dentry *shadow, struct dentry *dentry) {
@@ -169,39 +204,42 @@ static void transaction_dentry_finish_metadata(struct _dentry *shadow, struct de
 	flags = (flags & ~changed) | (shadow->d_flags & changed);
 	shadow->d_flags = flags;
 	WRITE_ONCE(dentry->d_flags, flags);
-	if (shadow->d_time == baseline->d_time)
-		shadow->d_time = dentry->d_time;
-	else
-		dentry->d_time = shadow->d_time;
-	shadow->d_inode = READ_ONCE(dentry->d_inode);
-	shadow->d_parent = READ_ONCE(dentry->d_parent);
-	transaction_dentry_name_put(shadow);
-	transaction_dentry_copy_name_from_stable(shadow, dentry);
-	shadow->d_op = dentry->d_op;
+	if (shadow->d_parent != baseline->d_parent) {
+		shadow->d_parent->d_lockref.count++;
+		if (baseline->d_parent != dentry) {
+			WARN_ON_ONCE(baseline->d_parent->d_lockref.count <= 0);
+			baseline->d_parent->d_lockref.count--;
+		}
+	}
+	WARN_ON_ONCE(!dentry->transaction_publish_active);
+	transaction_dentry_name_restore(dentry, shadow);
+	transaction_dentry_publish_inode(dentry, baseline->d_inode, shadow->d_inode);
+	WRITE_ONCE(dentry->d_inode, shadow->d_inode);
+	WRITE_ONCE(dentry->d_parent, shadow->d_parent);
+	dentry->d_time = shadow->d_time;
+	dentry->d_op = shadow->d_op;
 }
 
 static int transaction_dentry_commit(struct txobj_thread_list_node *node) {
 	struct _dentry *shadow = node->shadow_obj;
+	struct transaction_dentry_private *private;
 	struct dentry *dentry = node->orig_obj;
 	struct _dentry *baseline;
 	struct _dentry *old;
 
 	if (!shadow)
 		return 0;
-	if (node->rw == TRANSACTION_ACCESS_READ) {
-		transaction_dentry_contents_put(shadow);
-		node->shadow_obj = NULL;
+	if (node->rw == TRANSACTION_ACCESS_READ)
 		return 0;
-	}
+	private = transaction_dentry_private(shadow);
 	old = transaction_dentry_committed_locked(dentry);
 	baseline = shadow->shadow;
 	WARN_ON_ONCE(baseline != old);
 	transaction_dentry_finish_metadata(shadow, dentry);
-	kfree(shadow->relations);
-	shadow->relations = NULL;
 	shadow->shadow = NULL;
+	refcount_inc(&shadow->tx_refcount);
 	rcu_assign_pointer(dentry->d_contents, shadow);
-	node->shadow_obj = NULL;
+	private->published = true;
 	node->tx_obj->version++;
 	transaction_dentry_contents_put(old);
 	transaction_dentry_contents_put(baseline);
@@ -210,64 +248,125 @@ static int transaction_dentry_commit(struct txobj_thread_list_node *node) {
 
 static int transaction_dentry_abort(struct txobj_thread_list_node *node) {
 	struct _dentry *shadow = node->shadow_obj;
-	struct dentry *dentry = node->orig_obj;
-	struct _dentry *baseline;
-	unsigned int changed;
-	unsigned int flags;
 
 	if (!shadow)
 		return 0;
-	if (node->rw == TRANSACTION_ACCESS_READ) {
-		transaction_dentry_contents_put(shadow);
-		node->shadow_obj = NULL;
+	if (node->rw == TRANSACTION_ACCESS_READ)
 		return 0;
-	}
-	baseline = shadow->shadow;
-	changed = (shadow->d_flags ^ baseline->d_flags) & TRANSACTION_DENTRY_FLAGS;
-	flags = READ_ONCE(dentry->d_flags);
-	flags = (flags & ~changed) | (baseline->d_flags & changed);
-	WRITE_ONCE(dentry->d_flags, flags);
-	dentry->d_time = baseline->d_time;
-	transaction_dentry_restore_relations(shadow, dentry);
-	transaction_dentry_private_put(shadow);
-	node->shadow_obj = NULL;
 	return 0;
 }
 
 static int transaction_dentry_release(struct txobj_thread_list_node *node, int early) {
 	struct dentry *dentry = node->orig_obj;
+	struct _dentry *shadow = node->shadow_obj;
+	struct transaction_dentry_private *private = NULL;
+	struct transaction_dentry_iput *deferred;
+	struct transaction_dentry_iput *next;
+	bool published = false;
 
-	if (node->rw == TRANSACTION_ACCESS_READ)
-		transaction_dentry_contents_put(node->shadow_obj);
-	else
-		transaction_dentry_private_put(node->shadow_obj);
+	if (node->rw == TRANSACTION_ACCESS_READ) {
+		transaction_dentry_contents_put(shadow);
+		shadow = NULL;
+	} else if (shadow) {
+		private = transaction_dentry_private(shadow);
+		published = private->published;
+		if (published && private->commit_iput)
+			transaction_dentry_put_committed_inode(dentry, private->commit_iput);
+		else if (!published && private->abort_iput)
+			iput(private->abort_iput);
+	}
+	if (private) {
+		list_for_each_entry_safe(deferred, next, &private->deferred_iputs, list) {
+			list_del(&deferred->list);
+			iput(deferred->inode);
+			kfree(deferred);
+		}
+	}
+	if (node->rw == TRANSACTION_ACCESS_READ_WRITE && shadow && !published)
+		transaction_dentry_private_put(shadow);
+	else if (published)
+		transaction_dentry_contents_put(shadow);
 	node->shadow_obj = NULL;
 	dput(dentry);
 	return 0;
 }
 
+int transaction_dentry_record_inode_change(struct dentry *dentry, struct inode *old_inode,
+					    struct inode *new_inode) {
+	struct transaction_dentry_iput *new_deferred = NULL;
+	struct transaction_dentry_iput *old_deferred = NULL;
+	struct _dentry *shadow = transaction_dentry_shadow(dentry);
+	struct transaction_dentry_private *private;
+	struct inode *baseline;
+	bool defer_new;
+	bool defer_old;
+
+	if (!shadow || IS_ERR(shadow))
+		return shadow ? PTR_ERR(shadow) : 0;
+	if (old_inode == new_inode)
+		return 0;
+	private = transaction_dentry_private(shadow);
+	baseline = shadow->shadow->d_inode;
+	defer_old = old_inode && old_inode != baseline && private->abort_iput == old_inode;
+	defer_new = new_inode && new_inode == baseline;
+	if (old_inode != baseline && old_inode && !defer_old)
+		return -EUCLEAN;
+	if (defer_old) {
+		old_deferred = kmalloc(sizeof(*old_deferred), GFP_ATOMIC);
+		if (!old_deferred)
+			return -ENOMEM;
+	}
+	if (defer_new) {
+		new_deferred = kmalloc(sizeof(*new_deferred), GFP_ATOMIC);
+		if (!new_deferred) {
+			kfree(old_deferred);
+			return -ENOMEM;
+		}
+	}
+	if (old_deferred) {
+		old_deferred->inode = old_inode;
+		list_add_tail(&old_deferred->list, &private->deferred_iputs);
+		private->abort_iput = NULL;
+	}
+	if (new_deferred) {
+		new_deferred->inode = new_inode;
+		list_add_tail(&new_deferred->list, &private->deferred_iputs);
+		private->abort_iput = NULL;
+	} else {
+		private->abort_iput = new_inode;
+	}
+	private->commit_iput = baseline && new_inode != baseline ? baseline : NULL;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_dentry_record_inode_change);
+
 static void transaction_dentry_setup_node(struct txobj_thread_list_node *node) {
+	struct dentry *dentry = node->orig_obj;
+
 	node->lock = transaction_dentry_lock;
 	node->unlock = transaction_dentry_unlock;
 	node->commit = transaction_dentry_commit;
 	node->abort = transaction_dentry_abort;
 	node->release = transaction_dentry_release;
+	node->nonblocking_lock_id = &dentry->d_lock;
+	node->nonblocking_nest_lock = &dentry->d_lock;
 }
 
 static struct _dentry *transaction_dentry_acquire_version(struct dentry *dentry,
 							   enum transaction_access_mode mode,
 							   bool locked, gfp_t gfp) {
-	struct transaction_dentry_relations *relations = NULL;
 	struct _dentry *candidate = NULL;
 	struct _dentry *committed;
 	struct _dentry *old = NULL;
 	struct _dentry *shadow = NULL;
+	struct transaction_dentry_private *private = NULL;
 
 	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
-		shadow = kmalloc(sizeof(*shadow), gfp);
-		relations = kzalloc(sizeof(*relations), gfp);
-		if (!shadow || !relations)
+		private = kmalloc(sizeof(*private), gfp);
+		if (!private)
 			goto fail;
+		transaction_dentry_private_init(private);
+		shadow = &private->contents;
 	}
 
 retry:
@@ -282,8 +381,7 @@ retry:
 		committed->embedded = true;
 		rcu_assign_pointer(dentry->d_contents, committed);
 	} else if (!transaction_dentry_matches_stable(committed, dentry)) {
-		/* Ordinary updates make the stable dentry the next committed baseline. */
-		/* TODO: Asymmetric conflicts must serialize this with active owners. */
+		// Ordinary updates make the stable dentry the next committed baseline.
 		if (!candidate) {
 			if (!locked) {
 				spin_unlock(&dentry->d_lock);
@@ -309,8 +407,6 @@ retry:
 		shadow = committed;
 	} else {
 		transaction_dentry_shadow_copy(shadow, committed);
-		shadow->relations = relations;
-		transaction_dentry_capture_relations(shadow, dentry);
 	}
 	if (!locked)
 		spin_unlock(&dentry->d_lock);
@@ -323,15 +419,13 @@ fail_locked:
 		spin_unlock(&dentry->d_lock);
 fail:
 	kfree(candidate);
-	kfree(relations);
-	kfree(shadow);
+	kfree(private);
 	return NULL;
 }
 
 static struct _dentry *__transaction_dentry_get(struct dentry *dentry,
 						 enum transaction_access_mode mode,
-						 bool locked, bool restore_unlink_pin) {
-	struct transaction_dentry_relations *relations;
+						 bool locked) {
 	struct txobj_thread_list_node *node;
 	struct transaction *transaction;
 	struct _dentry *shadow;
@@ -355,26 +449,21 @@ static struct _dentry *__transaction_dentry_get(struct dentry *dentry,
 	node = transaction_workset_find_object(transaction, &dentry->transaction_object);
 	if (node) {
 		if (node->rw < mode) {
-			struct transaction_dentry_relations *upgrade_relations;
+			struct transaction_dentry_private *private;
 
-			shadow = kmalloc(sizeof(*shadow), gfp);
-			upgrade_relations = kzalloc(sizeof(*upgrade_relations), gfp);
-			if (!shadow || !upgrade_relations) {
-				kfree(upgrade_relations);
-				kfree(shadow);
+			private = kmalloc(sizeof(*private), gfp);
+			if (!private)
 				return ERR_PTR(-ENOMEM);
-			}
+			transaction_dentry_private_init(private);
+			shadow = &private->contents;
 			ret = transaction_object_acquire(transaction, node, mode, NULL);
 			if (ret) {
-				kfree(upgrade_relations);
-				kfree(shadow);
+				kfree(private);
 				return ERR_PTR(ret);
 			}
 			if (!locked)
 				spin_lock(&dentry->d_lock);
 			transaction_dentry_shadow_copy(shadow, node->shadow_obj);
-			shadow->relations = upgrade_relations;
-			transaction_dentry_capture_relations(shadow, dentry);
 			if (!locked)
 				spin_unlock(&dentry->d_lock);
 			transaction_dentry_contents_put(node->shadow_obj);
@@ -382,10 +471,6 @@ static struct _dentry *__transaction_dentry_get(struct dentry *dentry,
 			node->rw = mode;
 		}
 		shadow = node->shadow_obj;
-		if (restore_unlink_pin && node->rw == TRANSACTION_ACCESS_READ_WRITE) {
-			relations = shadow->relations;
-			relations->restore_unlink_pin = true;
-		}
 		return shadow;
 	}
 
@@ -414,10 +499,6 @@ static struct _dentry *__transaction_dentry_get(struct dentry *dentry,
 		return ERR_PTR(-ENOMEM);
 	}
 	node->shadow_obj = shadow;
-	if (restore_unlink_pin) {
-		relations = shadow->relations;
-		relations->restore_unlink_pin = true;
-	}
 	return shadow;
 
 free_node:
@@ -433,7 +514,7 @@ free_node:
 }
 
 struct _dentry *transaction_dentry_get(struct dentry *dentry, enum transaction_access_mode mode) {
-	return __transaction_dentry_get(dentry, mode, false, false);
+	return __transaction_dentry_get(dentry, mode, false);
 }
 EXPORT_SYMBOL_GPL(transaction_dentry_get);
 
@@ -496,13 +577,25 @@ EXPORT_SYMBOL_GPL(transaction_dentry_set_flags);
 
 int transaction_dentry_snapshot(struct dentry *dentry) {
 	struct _dentry *shadow;
+	struct transaction *winner;
+	int ret;
 
 	if (!dentry)
 		return -EINVAL;
-	// TODO: Resolve ordinary conflicts after dcache relationships use transactional hlists.
-	if (!current_transaction())
-		return 0;
-	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, false, false);
+	if (!current_transaction()) {
+retry:
+		spin_lock(&dentry->d_lock);
+		winner = transaction_check_asymmetric_conflict(&dentry->transaction_object,
+							       TRANSACTION_ACCESS_READ_WRITE, true, &ret);
+		spin_unlock(&dentry->d_lock);
+		if (!winner)
+			return ret;
+		ret = transaction_wait_on_conflict(winner);
+		if (!ret)
+			goto retry;
+		return ret;
+	}
+	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, false);
 	return IS_ERR(shadow) ? PTR_ERR(shadow) : 0;
 }
 EXPORT_SYMBOL_GPL(transaction_dentry_snapshot);
@@ -510,13 +603,22 @@ EXPORT_SYMBOL_GPL(transaction_dentry_snapshot);
 int transaction_dentry_snapshot_locked(struct dentry *dentry) {
 	struct _dentry *shadow;
 	struct transaction *transaction;
+	struct transaction *winner;
+	int ret;
 
 	if (!dentry)
 		return -EINVAL;
 	transaction = current_transaction();
-	if (!transaction)
-		return 0;
-	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, true, false);
+	if (!transaction) {
+		winner = transaction_check_asymmetric_conflict(&dentry->transaction_object,
+							       TRANSACTION_ACCESS_READ_WRITE, false, &ret);
+		if (WARN_ON_ONCE(winner)) {
+			transaction_put(winner);
+			return -EUCLEAN;
+		}
+		return ret;
+	}
+	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, true);
 	if (!IS_ERR(shadow))
 		return 0;
 	abort_transaction(transaction);
@@ -530,8 +632,8 @@ int transaction_dentry_snapshot_unlink(struct dentry *dentry) {
 	if (!dentry)
 		return -EINVAL;
 	if (!current_transaction())
-		return 0;
-	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, false, true);
+		return transaction_dentry_snapshot(dentry);
+	shadow = __transaction_dentry_get(dentry, TRANSACTION_ACCESS_READ_WRITE, false);
 	return IS_ERR(shadow) ? PTR_ERR(shadow) : 0;
 }
 EXPORT_SYMBOL_GPL(transaction_dentry_snapshot_unlink);

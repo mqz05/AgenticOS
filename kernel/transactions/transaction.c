@@ -78,12 +78,12 @@ void transaction_workset_node_free(struct txobj_thread_list_node *node) {
 EXPORT_SYMBOL_GPL(transaction_workset_node_free);
 
 // Find an original object while the caller holds workset_lock.
-static struct txobj_thread_list_node *transaction_workset_find_orig_locked(struct transaction *transaction,
-                                                                           const void *orig_obj) {
+static struct txobj_thread_list_node *transaction_workset_find_orig_in_locked(struct skiplist_head *workset,
+								      const void *orig_obj) {
 	struct txobj_thread_list_node *node;
 	unsigned long address = (unsigned long)orig_obj;
 
-	skiplist_for_each_entry(node, &transaction->object_list,
+	skiplist_for_each_entry(node, workset,
 					    workset_list) {
 		unsigned long node_address = (unsigned long)node->orig_obj;
 
@@ -132,7 +132,10 @@ static int transaction_workset_add_to(struct transaction *transaction,
 		ret = -EBUSY;
 		goto out;
 	}
-	if (transaction_workset_find_object_in_locked(workset, node->tx_obj)) {
+	if (transaction_workset_find_object_in_locked(&transaction->object_list, node->tx_obj) ||
+	    transaction_workset_find_object_in_locked(&transaction->list_list, node->tx_obj) ||
+	    transaction_workset_find_orig_in_locked(&transaction->object_list, node->orig_obj) ||
+	    transaction_workset_find_orig_in_locked(&transaction->list_list, node->orig_obj)) {
 		ret = -EEXIST;
 		goto out;
 	}
@@ -169,7 +172,9 @@ struct txobj_thread_list_node *transaction_workset_find_orig(struct transaction 
 		return NULL;
 
 	spin_lock(&transaction->workset_lock);
-	node = transaction_workset_find_orig_locked(transaction, orig_obj);
+	node = transaction_workset_find_orig_in_locked(&transaction->object_list, orig_obj);
+	if (!node)
+		node = transaction_workset_find_orig_in_locked(&transaction->list_list, orig_obj);
 	spin_unlock(&transaction->workset_lock);
 
 	return node;
@@ -563,11 +568,37 @@ static void terminate_transaction(struct transaction * transaction) {
 	wake_up_all(&transaction->siblings);
 }
 
+static bool transaction_workset_lock_held(struct skiplist_head *workset, void *lock_id, bool blocking) {
+	struct txobj_thread_list_node *node;
+
+	if (!lock_id)
+		return false;
+	skiplist_for_each_entry(node, workset, workset_list) {
+		if (blocking && node->blocking_lock_acquired && node->blocking_lock_id == lock_id)
+			return true;
+		if (!blocking && node->nonblocking_lock_acquired && node->nonblocking_lock_id == lock_id)
+			return true;
+	}
+	return false;
+}
+
+static void transaction_workset_merge(struct skiplist_head *source, struct skiplist_head *destination) {
+	struct skiplist_head *first;
+
+	while ((first = skiplist_first(source))) {
+		skiplist_del(first, source);
+		WARN_ON_ONCE(skiplist_insert(first, destination, transaction_workset_compare));
+	}
+}
+
+static bool transaction_workset_is_list(const struct txobj_thread_list_node *node) {
+	return node->type == TRANSACTION_OBJECT_LIST_HEAD || node->type == TRANSACTION_OBJECT_HLIST_HEAD;
+}
+
 /*
- * Finish all objects in kernel address order. Blocking object locks are
- * acquired first, followed by non-blocking locks and transaction-object
- * locks. Ownership and callbacks remain protected until every object has
- * committed or aborted.
+ * Merge both worksets into address order. Object sleep locks precede list
+ * protocols, then non-blocking and transaction-object locks follow in the
+ * merged order. Ownership remains protected through every callback.
  */
 static int transaction_finish_workset(struct transaction *transaction) {
 	struct txobj_thread_list_node *first_node;
@@ -585,23 +616,41 @@ static int transaction_finish_workset(struct transaction *transaction) {
 
 	skiplist_init_head(&workset);
 	spin_lock(&transaction->workset_lock);
-	skiplist_splice_init(&transaction->list_list, &workset);
-	skiplist_splice_init(&transaction->object_list, &workset);
+	transaction_workset_merge(&transaction->object_list, &workset);
+	transaction_workset_merge(&transaction->list_list, &workset);
 	spin_unlock(&transaction->workset_lock);
 
-	// Acquire blocking locks in original-object address order.
+	// Record the common address order used by shared-lock detection.
 	skiplist_for_each_entry(node, &workset, workset_list) {
 		node->ordered_lock_prev = previous_node;
 		previous_node = node;
-		if (node->lock)
+		node->blocking_lock_acquired = false;
+		node->nonblocking_lock_acquired = false;
+	}
+
+	// Acquire object sleep locks before list publication protocols.
+	skiplist_for_each_entry(node, &workset, workset_list) {
+		if (!transaction_workset_is_list(node) && node->lock &&
+		    !transaction_workset_lock_held(&workset, node->blocking_lock_id, true)) {
 			WARN_ON_ONCE(node->lock(node, 1));
+			node->blocking_lock_acquired = true;
+		}
+	}
+	skiplist_for_each_entry(node, &workset, workset_list) {
+		if (transaction_workset_is_list(node) && node->lock &&
+		    !transaction_workset_lock_held(&workset, node->blocking_lock_id, true)) {
+			WARN_ON_ONCE(node->lock(node, 1));
+			node->blocking_lock_acquired = true;
+		}
 	}
 
 	// Acquire non-blocking locks, then every transaction-object lock.
 	first_node = skiplist_entry_safe(skiplist_first(&workset), struct txobj_thread_list_node, workset_list);
 	skiplist_for_each_entry(node, &workset, workset_list) {
-		if (node->lock)
+		if (node->lock && !transaction_workset_lock_held(&workset, node->nonblocking_lock_id, false)) {
 			WARN_ON_ONCE(node->lock(node, 0));
+			node->nonblocking_lock_acquired = true;
+		}
 		if (node == first_node)
 			spin_lock(&node->tx_obj->lock);
 		else
@@ -663,13 +712,17 @@ static int transaction_finish_workset(struct transaction *transaction) {
 	// Release transaction-object and non-blocking locks in reverse order.
 	skiplist_for_each_entry_reverse(node, &workset, workset_list) {
 		spin_unlock(&node->tx_obj->lock);
-		if (node->unlock)
+		if (node->unlock && node->nonblocking_lock_acquired)
 			WARN_ON_ONCE(node->unlock(node, 0));
 	}
 
-	// Release blocking locks in reverse order.
+	// Release list protocols before ordinary object sleep locks.
 	skiplist_for_each_entry_reverse(node, &workset, workset_list) {
-		if (node->unlock)
+		if (transaction_workset_is_list(node) && node->unlock && node->blocking_lock_acquired)
+			WARN_ON_ONCE(node->unlock(node, 1));
+	}
+	skiplist_for_each_entry_reverse(node, &workset, workset_list) {
+		if (!transaction_workset_is_list(node) && node->unlock && node->blocking_lock_acquired)
 			WARN_ON_ONCE(node->unlock(node, 1));
 	}
 

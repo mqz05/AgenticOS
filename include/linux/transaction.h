@@ -125,6 +125,8 @@ struct transaction_object {
 	struct list_head readers;
 	spinlock_t lock;
 	u64 version;
+	// Preserve the committed version before an ordinary writer takes over.
+	int (*replace_committed)(struct transaction_object *object);
 };
 
 // An entry in a transaction's working set.
@@ -142,6 +144,12 @@ struct txobj_thread_list_node {
 	enum transaction_access_mode rw;
 	// Previous workset node in final object-lock order.
 	struct txobj_thread_list_node *ordered_lock_prev;
+	// Shared native locks are acquired once across object and list adapters.
+	void *blocking_lock_id;
+	void *nonblocking_lock_id;
+	spinlock_t *nonblocking_nest_lock;
+	bool blocking_lock_acquired;
+	bool nonblocking_lock_acquired;
 	/*
 	 * TODO: Optional validation may return an errno to abort before commit. The
 	 * other callbacks are expected to succeed; nonzero returns warn.
@@ -201,6 +209,7 @@ bool transaction_inode_set_size(struct inode *inode, loff_t size);
 bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode, const struct iattr *attr);
 int transaction_inode_read(struct inode *inode);
 int transaction_inode_snapshot(struct inode *inode);
+int transaction_inode_replace_committed_locked(struct transaction_object *object);
 void transaction_dentry_init(struct dentry *dentry);
 void transaction_dentry_destroy(struct dentry *dentry);
 void transaction_dentry_name_get(struct _dentry *contents, struct dentry *dentry);
@@ -215,6 +224,10 @@ bool transaction_dentry_set_flags(struct dentry *dentry, unsigned int flags, uns
 int transaction_dentry_snapshot(struct dentry *dentry);
 int transaction_dentry_snapshot_locked(struct dentry *dentry);
 int transaction_dentry_snapshot_unlink(struct dentry *dentry);
+int transaction_dentry_record_inode_change(struct dentry *dentry, struct inode *old_inode, struct inode *new_inode);
+void transaction_dentry_publish_inode(struct dentry *dentry, struct inode *old_inode, struct inode *new_inode);
+void transaction_dentry_put_committed_inode(struct dentry *dentry, struct inode *inode);
+int transaction_dentry_replace_committed_locked(struct transaction_object *object);
 
 struct transaction *transaction_alloc(gfp_t gfp);
 struct transaction *transaction_get(struct transaction *transaction);

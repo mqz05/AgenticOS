@@ -12,6 +12,7 @@ void transaction_object_init(struct transaction_object *object, enum transaction
 	INIT_LIST_HEAD(&object->readers);
 	spin_lock_init(&object->lock);
 	object->version = 0;
+	object->replace_committed = NULL;
 }
 EXPORT_SYMBOL_GPL(transaction_object_init);
 
@@ -81,7 +82,10 @@ static int transaction_object_abort_conflicts_locked(struct transaction_object *
 	lockdep_assert_held(&object->lock);
 	// Only private-version objects and speculative hlists support immediate takeover.
 	if (object->type != TRANSACTION_OBJECT_FILE && object->type != TRANSACTION_OBJECT_INODE &&
-	    object->type != TRANSACTION_OBJECT_HLIST_HEAD)
+	    object->type != TRANSACTION_OBJECT_DENTRY && object->type != TRANSACTION_OBJECT_HLIST_HEAD)
+		return -EOPNOTSUPP;
+	if (object->type == TRANSACTION_OBJECT_DENTRY && mode == TRANSACTION_ACCESS_READ_WRITE &&
+	    !list_empty(&object->readers) && !object->replace_committed)
 		return -EOPNOTSUPP;
 
 	// Check every owner before changing transaction or ownership state.
@@ -118,6 +122,12 @@ static int transaction_object_abort_conflicts_locked(struct transaction_object *
 
 	// Private versions or speculative logs preserve each transaction's view.
 	if (mode == TRANSACTION_ACCESS_READ_WRITE) {
+		if ((object->type == TRANSACTION_OBJECT_INODE || object->type == TRANSACTION_OBJECT_DENTRY) &&
+		    !list_empty(&object->readers) && object->replace_committed) {
+			ret = object->replace_committed(object);
+			if (ret)
+				return ret;
+		}
 		list_for_each_entry_safe(reader, next, &object->readers, object_list)
 			list_del_init(&reader->object_list);
 		object->writer = NULL;
@@ -155,11 +165,11 @@ struct transaction *transaction_check_asymmetric_conflict(struct transaction_obj
 
 	spin_lock(&object->lock);
 	// Reads conflict with a writer, writes conflict with any owner.
+	// No owner conflicts with this ordinary access.
 	if (!object->writer && (mode == TRANSACTION_ACCESS_READ || list_empty(&object->readers)))
-		// No conflict
 		goto out;
-	
-	// Preemptible non-transaction, contention manager decides winner
+
+	// A sleepable ordinary caller uses the contention manager.
 	if (can_sleep) {
 		winner = transaction_object_waiter_locked(object, mode);
 		if (winner) {
@@ -168,7 +178,7 @@ struct transaction *transaction_check_asymmetric_conflict(struct transaction_obj
 		}
 	}
 
-	// Non-preemptible non-transaction wins over transactions
+	// A caller that cannot wait takes over from active transactions.
 	ret = transaction_object_abort_conflicts_locked(object, mode);
 	if (error)
 		*error = ret;

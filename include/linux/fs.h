@@ -900,6 +900,9 @@ struct inode {
 	union {
 		struct hlist_head	i_dentry;
 		struct rcu_head		i_rcu;
+#ifdef CONFIG_TRANSACTIONS
+		struct tx_hlist_head	i_dentry_tx;
+#endif
 	};
 	atomic64_t		i_version;
 	atomic64_t		i_sequence; /* see futex */
@@ -1535,7 +1538,12 @@ struct super_block {
 	struct unicode_map *s_encoding;
 	__u16 s_encoding_flags;
 #endif
-	struct hlist_bl_head	s_roots;	/* alternate root dentries for NFS */
+	union {
+		struct hlist_bl_head	s_roots;	/* committed alternate roots */
+#ifdef CONFIG_TRANSACTIONS
+		struct tx_hlist_bl_head s_roots_tx;
+#endif
+	};
 	struct mount		*s_mounts;	/* list of mounts; _not_ for fs use */
 	struct block_device	*s_bdev;	/* can go away once we use an accessor for @s_bdev_file */
 	struct file		*s_bdev_file;
@@ -4190,8 +4198,7 @@ static inline bool dir_emit(struct dir_context *ctx,
 }
 static inline bool dir_emit_dot(struct file *file, struct dir_context *ctx)
 {
-	return ctx->actor(ctx, ".", 1, ctx->pos,
-			  file->f_path.dentry->d_inode->i_ino, DT_DIR);
+	return ctx->actor(ctx, ".", 1, ctx->pos, d_inode(file->f_path.dentry)->i_ino, DT_DIR);
 }
 static inline bool dir_emit_dotdot(struct file *file, struct dir_context *ctx)
 {

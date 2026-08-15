@@ -127,17 +127,29 @@ void tx_hlist_entry_init_with_lifetime(struct tx_hlist_entry_ref *ref, tx_hlist_
 void tx_hlist_entry_set_publish_callbacks(struct tx_hlist_entry_ref *ref, tx_hlist_publish_t begin, tx_hlist_publish_t end);
 int tx_hlist_add_head(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head);
 int tx_hlist_add_head_locked(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head);
+// Resolve ordinary conflicts while the caller is still allowed to sleep.
+int tx_hlist_prepare(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head,
+			     enum transaction_access_mode mode);
 int tx_hlist_del(struct tx_hlist_entry_ref *ref);
 int tx_hlist_del_locked(struct tx_hlist_entry_ref *ref);
 int tx_hlist_move(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head);
 int tx_hlist_empty(struct tx_hlist_head *head);
 bool tx_hlist_unreferenced(struct tx_hlist_entry_ref *ref);
+bool tx_hlist_visible_unhashed(struct tx_hlist_entry_ref *ref);
 int tx_hlist_get_iterator(struct tx_hlist_iterator *iter, struct tx_hlist_head *head);
+int tx_hlist_get_iterator_locked(struct tx_hlist_iterator *iter, struct tx_hlist_head *head);
 void tx_hlist_put_iterator(struct tx_hlist_iterator *iter);
+void tx_hlist_put_iterator_locked(struct tx_hlist_iterator *iter);
 bool tx_hlist_iter_next(struct tx_hlist_iterator *iter);
+struct tx_hlist_entry_ref *tx_hlist_first_locked(struct tx_hlist_head *head);
+struct tx_hlist_entry_ref *tx_hlist_next_locked(struct tx_hlist_entry_ref *ref);
 
 void tx_hlist_bl_head_init(struct tx_hlist_bl_head *head);
 int tx_hlist_bl_head_set_callbacks(struct tx_hlist_bl_head *head, const struct tx_hlist_head_callbacks *callbacks);
+int tx_hlist_bl_head_set_callbacks_locked(struct tx_hlist_bl_head *head,
+					  const struct tx_hlist_head_callbacks *callbacks);
+// Preserve the native ordinary path until a bucket needs transactional state.
+int tx_hlist_bl_head_set_callbacks_lazy_locked(struct tx_hlist_bl_head *head, const struct tx_hlist_head_callbacks *callbacks);
 // Destroy is valid only after callers and entries stop referencing the empty head.
 int tx_hlist_bl_head_destroy(struct tx_hlist_bl_head *head);
 void tx_hlist_bl_entry_init(struct tx_hlist_bl_entry_ref *ref);
@@ -146,16 +158,24 @@ void tx_hlist_bl_entry_init_with_lifetime(struct tx_hlist_bl_entry_ref *ref, tx_
 void tx_hlist_bl_entry_set_publish_callbacks(struct tx_hlist_bl_entry_ref *ref, tx_hlist_publish_t begin, tx_hlist_publish_t end);
 int tx_hlist_bl_add_head(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head);
 int tx_hlist_bl_add_head_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head);
+int tx_hlist_bl_add_head_lazy_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head);
+// Resolve ordinary bucket conflicts before taking surrounding VFS locks.
+int tx_hlist_bl_prepare(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head, enum transaction_access_mode mode);
 int tx_hlist_bl_del(struct tx_hlist_bl_entry_ref *ref);
 int tx_hlist_bl_del_locked(struct tx_hlist_bl_entry_ref *ref);
+// The explicit head adopts native entries without a sidecar parent.
+int tx_hlist_bl_del_head_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head);
 int tx_hlist_bl_move(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head);
 // The caller holds the complete outer publication protocol; bucket locks are acquired here.
 // Transactional moves reacquire the registered protocol when the workset finishes.
 int tx_hlist_bl_move_under_protocol(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head);
 int tx_hlist_bl_empty(struct tx_hlist_bl_head *head);
 bool tx_hlist_bl_unreferenced(struct tx_hlist_bl_entry_ref *ref);
+bool tx_hlist_bl_visible_unhashed(struct tx_hlist_bl_entry_ref *ref);
 int tx_hlist_bl_get_iterator(struct tx_hlist_bl_iterator *iter, struct tx_hlist_bl_head *head);
+int tx_hlist_bl_get_iterator_locked(struct tx_hlist_bl_iterator *iter, struct tx_hlist_bl_head *head);
 void tx_hlist_bl_put_iterator(struct tx_hlist_bl_iterator *iter);
+void tx_hlist_bl_put_iterator_locked(struct tx_hlist_bl_iterator *iter);
 bool tx_hlist_bl_iter_next(struct tx_hlist_bl_iterator *iter);
 
 #define tx_hlist_iter_entry(iter, type, member) container_of((iter)->cursor, type, member)
@@ -241,6 +261,11 @@ static inline int tx_hlist_add_head(struct tx_hlist_entry_ref *ref, struct tx_hl
 	return ret;
 }
 
+static inline int tx_hlist_prepare(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head,
+				   int mode) {
+	return 0;
+}
+
 static inline int tx_hlist_del_locked(struct tx_hlist_entry_ref *ref) {
 	if (!hlist_unhashed(&ref->node))
 		hlist_del_init(&ref->node);
@@ -282,6 +307,10 @@ static inline bool tx_hlist_unreferenced(struct tx_hlist_entry_ref *ref) {
 	return hlist_unhashed(&ref->node);
 }
 
+static inline bool tx_hlist_visible_unhashed(struct tx_hlist_entry_ref *ref) {
+	return hlist_unhashed(&ref->node);
+}
+
 static inline int tx_hlist_empty(struct tx_hlist_head *head) {
 	int empty;
 
@@ -298,9 +327,17 @@ static inline int tx_hlist_get_iterator(struct tx_hlist_iterator *iter, struct t
 	return 0;
 }
 
+static inline int tx_hlist_get_iterator_locked(struct tx_hlist_iterator *iter, struct tx_hlist_head *head) {
+	iter->head = head;
+	iter->next = head->head.first;
+	return 0;
+}
+
 static inline void tx_hlist_put_iterator(struct tx_hlist_iterator *iter) {
 	spin_unlock(iter->head->lock);
 }
+
+static inline void tx_hlist_put_iterator_locked(struct tx_hlist_iterator *iter) { }
 
 static inline bool tx_hlist_iter_next(struct tx_hlist_iterator *iter) {
 	if (!iter->next)
@@ -308,6 +345,14 @@ static inline bool tx_hlist_iter_next(struct tx_hlist_iterator *iter) {
 	iter->cursor = hlist_entry(iter->next, struct tx_hlist_entry_ref, node);
 	iter->next = iter->next->next;
 	return true;
+}
+
+static inline struct tx_hlist_entry_ref *tx_hlist_first_locked(struct tx_hlist_head *head) {
+	return hlist_entry_safe(head->head.first, struct tx_hlist_entry_ref, node);
+}
+
+static inline struct tx_hlist_entry_ref *tx_hlist_next_locked(struct tx_hlist_entry_ref *ref) {
+	return hlist_entry_safe(ref->node.next, struct tx_hlist_entry_ref, node);
 }
 
 static inline void tx_hlist_bl_head_init(struct tx_hlist_bl_head *head) {
@@ -319,6 +364,16 @@ static inline int tx_hlist_bl_head_set_callbacks(struct tx_hlist_bl_head *head,
 	return callbacks && !(!callbacks->get != !callbacks->put) &&
 	       !(!callbacks->lock != !callbacks->unlock) &&
 	       (!!callbacks->lock == !!callbacks->lock_id) ? 0 : -EINVAL;
+}
+
+static inline int tx_hlist_bl_head_set_callbacks_locked(struct tx_hlist_bl_head *head,
+							  const struct tx_hlist_head_callbacks *callbacks) {
+	return tx_hlist_bl_head_set_callbacks(head, callbacks);
+}
+
+static inline int tx_hlist_bl_head_set_callbacks_lazy_locked(struct tx_hlist_bl_head *head,
+							       const struct tx_hlist_head_callbacks *callbacks) {
+	return tx_hlist_bl_head_set_callbacks(head, callbacks);
 }
 
 static inline int tx_hlist_bl_head_destroy(struct tx_hlist_bl_head *head) {
@@ -352,6 +407,11 @@ static inline int tx_hlist_bl_add_head_locked(struct tx_hlist_bl_entry_ref *ref,
 	return 0;
 }
 
+static inline int tx_hlist_bl_add_head_lazy_locked(struct tx_hlist_bl_entry_ref *ref,
+						   struct tx_hlist_bl_head *head) {
+	return tx_hlist_bl_add_head_locked(ref, head);
+}
+
 static inline int tx_hlist_bl_add_head(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head) {
 	int ret;
 
@@ -361,6 +421,11 @@ static inline int tx_hlist_bl_add_head(struct tx_hlist_bl_entry_ref *ref, struct
 	return ret;
 }
 
+static inline int tx_hlist_bl_prepare(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head,
+				      int mode) {
+	return 0;
+}
+
 static inline int tx_hlist_bl_del_locked(struct tx_hlist_bl_entry_ref *ref) {
 	if (!hlist_bl_unhashed(&ref->node)) {
 		__hlist_bl_del(&ref->node);
@@ -368,6 +433,11 @@ static inline int tx_hlist_bl_del_locked(struct tx_hlist_bl_entry_ref *ref) {
 	}
 	ref->parent = NULL;
 	return 0;
+}
+
+static inline int tx_hlist_bl_del_head_locked(struct tx_hlist_bl_entry_ref *ref,
+					       struct tx_hlist_bl_head *head) {
+	return tx_hlist_bl_del_locked(ref);
 }
 
 static inline int tx_hlist_bl_del(struct tx_hlist_bl_entry_ref *ref) {
@@ -410,6 +480,10 @@ static inline bool tx_hlist_bl_unreferenced(struct tx_hlist_bl_entry_ref *ref) {
 	return hlist_bl_unhashed(&ref->node);
 }
 
+static inline bool tx_hlist_bl_visible_unhashed(struct tx_hlist_bl_entry_ref *ref) {
+	return hlist_bl_unhashed(&ref->node);
+}
+
 static inline int tx_hlist_bl_empty(struct tx_hlist_bl_head *head) {
 	int empty;
 
@@ -426,9 +500,18 @@ static inline int tx_hlist_bl_get_iterator(struct tx_hlist_bl_iterator *iter, st
 	return 0;
 }
 
+static inline int tx_hlist_bl_get_iterator_locked(struct tx_hlist_bl_iterator *iter,
+						   struct tx_hlist_bl_head *head) {
+	iter->head = head;
+	iter->next = hlist_bl_first(&head->head);
+	return 0;
+}
+
 static inline void tx_hlist_bl_put_iterator(struct tx_hlist_bl_iterator *iter) {
 	hlist_bl_unlock(&iter->head->head);
 }
+
+static inline void tx_hlist_bl_put_iterator_locked(struct tx_hlist_bl_iterator *iter) { }
 
 static inline bool tx_hlist_bl_iter_next(struct tx_hlist_bl_iterator *iter) {
 	if (!iter->next)
@@ -442,54 +525,5 @@ static inline bool tx_hlist_bl_iter_next(struct tx_hlist_bl_iterator *iter) {
 #define tx_hlist_bl_iter_entry(iter, type, member) container_of((iter)->cursor, type, member)
 
 #endif
-
-// Temporary raw checkpoints retained until dentry relations use the speculative API.
-struct tx_hlist_node_snapshot {
-	struct hlist_node *next;
-	struct hlist_node **pprev;
-};
-
-struct tx_hlist_bl_node_snapshot {
-	struct hlist_bl_node *next;
-	struct hlist_bl_node **pprev;
-};
-
-static inline void tx_hlist_snapshot(struct hlist_node *node, struct tx_hlist_node_snapshot *snapshot) {
-	snapshot->next = node->next;
-	snapshot->pprev = node->pprev;
-}
-
-static inline void tx_hlist_bl_snapshot(struct hlist_bl_node *node, struct tx_hlist_bl_node_snapshot *snapshot) {
-	snapshot->next = node->next;
-	snapshot->pprev = node->pprev;
-}
-
-static inline void tx_hlist_restore(struct hlist_node *node, const struct tx_hlist_node_snapshot *snapshot) {
-	if (!hlist_unhashed(node))
-		__hlist_del(node);
-
-	node->next = snapshot->next;
-	node->pprev = snapshot->pprev;
-	if (snapshot->pprev) {
-		WRITE_ONCE(*snapshot->pprev, node);
-		if (snapshot->next)
-			snapshot->next->pprev = &node->next;
-	}
-}
-
-static inline void tx_hlist_bl_restore(struct hlist_bl_node *node, const struct tx_hlist_bl_node_snapshot *snapshot) {
-	if (!hlist_bl_unhashed(node))
-		__hlist_bl_del(node);
-
-	node->next = snapshot->next;
-	node->pprev = snapshot->pprev;
-	if (snapshot->pprev) {
-		WRITE_ONCE(*snapshot->pprev,
-			   (struct hlist_bl_node *)((uintptr_t)node |
-			   ((uintptr_t)*snapshot->pprev & LIST_BL_LOCKMASK)));
-		if (snapshot->next)
-			snapshot->next->pprev = &node->next;
-	}
-}
 
 #endif

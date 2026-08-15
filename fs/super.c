@@ -281,6 +281,9 @@ static void destroy_super_work(struct work_struct *work)
 	kfree(s->s_subtype);
 	for (int i = 0; i < SB_FREEZE_LEVELS; i++)
 		percpu_free_rwsem(&s->s_writers.rw_sem[i]);
+#ifdef CONFIG_TRANSACTIONS
+	WARN_ON(tx_hlist_bl_head_destroy(&s->s_roots_tx));
+#endif
 	kfree(s);
 }
 
@@ -357,7 +360,11 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags,
 	if (s->s_user_ns != &init_user_ns)
 		s->s_iflags |= SB_I_NODEV;
 	INIT_HLIST_NODE(&s->s_instances);
+#ifdef CONFIG_TRANSACTIONS
+	tx_hlist_bl_head_init(&s->s_roots_tx);
+#else
 	INIT_HLIST_BL_HEAD(&s->s_roots);
+#endif
 	mutex_init(&s->s_sync_lock);
 	INIT_LIST_HEAD(&s->s_inodes);
 	spin_lock_init(&s->s_inode_list_lock);

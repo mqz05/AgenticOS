@@ -15,6 +15,9 @@
 #include <linux/stringhash.h>
 #include <linux/wait.h>
 #include <linux/transaction.h>
+#ifdef CONFIG_TRANSACTIONS
+#include <linux/tx_hlist.h>
+#endif
 
 struct path;
 struct file;
@@ -102,6 +105,7 @@ struct _dentry {
 	refcount_t tx_refcount;
 	struct rcu_head d_rcu;
 	bool embedded;
+	bool owns_inode; // A displaced committed version pins its old inode.
 	unsigned int d_flags;
 	struct inode *d_inode;
 	struct dentry *d_parent;
@@ -109,7 +113,6 @@ struct _dentry {
 	union shortname_store d_shortname;
 	unsigned long d_time;
 	const struct dentry_operations *d_op;
-	void *relations;
 };
 #endif
 
@@ -117,7 +120,12 @@ struct dentry {
 	/* RCU lookup touched fields */
 	unsigned int d_flags;		/* protected by d_lock */
 	seqcount_spinlock_t d_seq;	/* per dentry seqlock */
-	struct hlist_bl_node d_hash;	/* lookup hash list */
+	union {
+		struct hlist_bl_node d_hash;	/* committed lookup hash link */
+#ifdef CONFIG_TRANSACTIONS
+		struct tx_hlist_bl_entry_ref d_hash_tx;
+#endif
+	};
 	struct dentry *d_parent;	/* parent directory */
 	union {
 	struct qstr __d_name;		/* for use ONLY in fs/dcache.c */
@@ -143,8 +151,18 @@ struct dentry {
 		struct list_head d_lru;		/* LRU list */
 		wait_queue_head_t *d_wait;	/* in-lookup ones only */
 	};
-	struct hlist_node d_sib;	/* child of parent list */
-	struct hlist_head d_children;	/* our children */
+	union {
+		struct hlist_node d_sib;	/* committed child link */
+#ifdef CONFIG_TRANSACTIONS
+		struct tx_hlist_entry_ref d_sib_tx;
+#endif
+	};
+	union {
+		struct hlist_head d_children;	/* committed children */
+#ifdef CONFIG_TRANSACTIONS
+		struct tx_hlist_head d_children_tx;
+#endif
+	};
 	/*
 	 * d_alias and d_rcu can share memory
 	 */
@@ -152,9 +170,13 @@ struct dentry {
 		struct hlist_node d_alias;	/* inode alias list */
 		struct hlist_bl_node d_in_lookup_hash;	/* only for in-lookup ones */
 	 	struct rcu_head d_rcu;
+#ifdef CONFIG_TRANSACTIONS
+		struct tx_hlist_entry_ref d_alias_tx;
+#endif
 	} d_u;
 #ifdef CONFIG_TRANSACTIONS
 	struct transaction_object transaction_object;
+	bool transaction_publish_active; // d_seq spans the complete ordered publish.
 	struct _dentry __rcu *d_contents;
 	struct _dentry d_committed;
 #endif
@@ -277,6 +299,7 @@ extern void d_instantiate_new(struct dentry *, struct inode *);
 extern void __d_drop(struct dentry *dentry);
 extern void d_drop(struct dentry *dentry);
 extern void d_delete(struct dentry *);
+extern int dentry_unlink_alias_locked(struct dentry *dentry);
 
 /* allocate/de-allocate */
 extern struct dentry * d_alloc(struct dentry *, const struct qstr *);
@@ -399,7 +422,11 @@ extern struct dentry *dget_parent(struct dentry *dentry);
  */
 static inline int d_unhashed(const struct dentry *dentry)
 {
+#ifdef CONFIG_TRANSACTIONS
+	return tx_hlist_bl_visible_unhashed((struct tx_hlist_bl_entry_ref *)&dentry->d_hash_tx);
+#else
 	return hlist_bl_unhashed(&dentry->d_hash);
+#endif
 }
 
 static inline int d_unlinked(const struct dentry *dentry)
@@ -658,11 +685,27 @@ void release_dentry_name_snapshot(struct name_snapshot *);
 
 static inline struct dentry *d_first_child(const struct dentry *dentry)
 {
+#ifdef CONFIG_TRANSACTIONS
+	if (current_transaction()) {
+		struct tx_hlist_entry_ref *ref;
+
+		ref = tx_hlist_first_locked((struct tx_hlist_head *)&dentry->d_children_tx);
+		return ref ? container_of(ref, struct dentry, d_sib_tx) : NULL;
+	}
+#endif
 	return hlist_entry_safe(dentry->d_children.first, struct dentry, d_sib);
 }
 
 static inline struct dentry *d_next_sibling(const struct dentry *dentry)
 {
+#ifdef CONFIG_TRANSACTIONS
+	if (current_transaction()) {
+		struct tx_hlist_entry_ref *ref;
+
+		ref = tx_hlist_next_locked((struct tx_hlist_entry_ref *)&dentry->d_sib_tx);
+		return ref ? container_of(ref, struct dentry, d_sib_tx) : NULL;
+	}
+#endif
 	return hlist_entry_safe(dentry->d_sib.next, struct dentry, d_sib);
 }
 

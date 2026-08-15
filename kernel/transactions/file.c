@@ -117,7 +117,7 @@ int transaction_file_snapshot(struct file * file) {
 	if (status == TRANSACTION_ABORTED || status == TRANSACTION_ABORTING)
 		return -ECANCELED;
 	if (status != TRANSACTION_ACTIVE)
-		return 0;
+		return -EBUSY;
 
 	if (transaction_workset_find_object(transaction, &file->transaction_object))
 		return 0;
@@ -146,6 +146,7 @@ int transaction_file_snapshot(struct file * file) {
 	node->unlock = transaction_file_unlock;
 	node->commit = transaction_file_commit;
 	node->release = transaction_file_release;
+	node->blocking_lock_id = file->f_mode & FMODE_ATOMIC_POS ? &file->f_pos_lock : NULL;
 	get_file(file);
 	ret = transaction_workset_add(transaction, node);
 	if (ret)

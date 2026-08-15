@@ -98,15 +98,34 @@ int iterate_dir(struct file *file, struct dir_context *ctx)
 	if (res)
 		goto out;
 
+#ifdef CONFIG_TRANSACTIONS
+	res = transaction_file_snapshot(file);
+	if (res)
+		goto out;
+#endif
+
 	res = down_read_killable(&inode->i_rwsem);
 	if (res)
 		goto out;
 
 	res = -ENOENT;
 	if (!IS_DEADDIR(inode)) {
+#ifdef CONFIG_TRANSACTIONS
+		ctx->pos = transaction_file_get_pos(file);
+#else
 		ctx->pos = file->f_pos;
+#endif
 		res = file->f_op->iterate_shared(file, ctx);
+#ifdef CONFIG_TRANSACTIONS
+		{
+			int pos_ret = transaction_file_set_pos(file, ctx->pos);
+
+			if (!res && pos_ret)
+				res = pos_ret;
+		}
+#else
 		file->f_pos = ctx->pos;
+#endif
 		fsnotify_access(file);
 		file_accessed(file);
 	}

@@ -60,6 +60,12 @@ static void tx_hlist_state_init(struct tx_hlist_head_state *state, void *owner, 
 	atomic_set(&state->worksets, 0);
 }
 
+static bool tx_hlist_callbacks_equal(const struct tx_hlist_head_callbacks *first,
+				      const struct tx_hlist_head_callbacks *second) {
+	return first->owner == second->owner && first->get == second->get && first->put == second->put &&
+	       first->lock_id == second->lock_id && first->lock == second->lock && first->unlock == second->unlock;
+}
+
 // Bitlocked heads keep transaction metadata out of large native hash tables.
 static struct tx_hlist_head_state *tx_hlist_bl_state(struct tx_hlist_bl_head *head, bool create) {
 	struct tx_hlist_head_state *state;
@@ -114,6 +120,10 @@ static int tx_hlist_state_set_callbacks(struct tx_hlist_head_state *state,
 	if (!!callbacks->lock != !!callbacks->lock_id)
 		return -EINVAL;
 	spin_lock(&state->transaction_object.lock);
+	if (tx_hlist_callbacks_equal(&state->callbacks, callbacks)) {
+		spin_unlock(&state->transaction_object.lock);
+		return 0;
+	}
 	if (state->transaction_object.writer || !list_empty(&state->transaction_object.readers) ||
 	    !list_empty(&state->spec_list) || atomic_read(&state->worksets)) {
 		spin_unlock(&state->transaction_object.lock);
@@ -178,6 +188,36 @@ int tx_hlist_bl_head_set_callbacks(struct tx_hlist_bl_head *head,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_head_set_callbacks);
+
+int tx_hlist_bl_head_set_callbacks_locked(struct tx_hlist_bl_head *head,
+					  const struct tx_hlist_head_callbacks *callbacks) {
+	struct tx_hlist_head_state *state = tx_hlist_bl_state(head, true);
+
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
+		return -EINVAL;
+	return tx_hlist_state_set_callbacks(state, callbacks);
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_head_set_callbacks_locked);
+
+int tx_hlist_bl_head_set_callbacks_lazy_locked(struct tx_hlist_bl_head *head,
+					       const struct tx_hlist_head_callbacks *callbacks) {
+	struct tx_hlist_head_state *state;
+
+	if (!callbacks || (!callbacks->get != !callbacks->put) || (!callbacks->lock != !callbacks->unlock) ||
+	    (!!callbacks->lock != !!callbacks->lock_id))
+		return -EINVAL;
+	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
+		return -EINVAL;
+	state = tx_hlist_bl_state(head, current_transaction() != NULL);
+	if (!state)
+		return 0;
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+	return tx_hlist_state_set_callbacks(state, callbacks);
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_head_set_callbacks_lazy_locked);
 
 int tx_hlist_bl_head_destroy(struct tx_hlist_bl_head *head) {
 	struct tx_hlist_head_state *state = tx_hlist_bl_state(head, false);
@@ -324,12 +364,8 @@ static int tx_hlist_lock(struct txobj_thread_list_node *node, int blocking) {
 		tx_hlist_lock_state(workset->state);
 	} else {
 		for (previous = node->ordered_lock_prev; previous; previous = previous->ordered_lock_prev) {
-			if (previous->type != TRANSACTION_OBJECT_HLIST_HEAD)
-				continue;
-			spinlock_t *nest_lock = tx_hlist_node_spinlock(previous);
-
-			if (nest_lock) {
-				spin_lock_nest_lock(lock, nest_lock);
+			if (previous->nonblocking_lock_acquired && previous->nonblocking_nest_lock) {
+				spin_lock_nest_lock(lock, previous->nonblocking_nest_lock);
 				goto acquired;
 			}
 		}
@@ -527,6 +563,7 @@ static int tx_hlist_abort(struct txobj_thread_list_node *node) {
 }
 
 static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_access_mode access,
+			    bool can_sleep, struct transaction **waiter,
 			    struct tx_hlist_workset **result) {
 	struct txobj_thread_list_node *node;
 	struct transaction *transaction = current_transaction();
@@ -538,11 +575,17 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 
 	if (result)
 		*result = NULL;
+	if (waiter)
+		*waiter = NULL;
 	if (!transaction) {
-		winner = transaction_check_asymmetric_conflict(&state->transaction_object, access, false, &ret);
-		if (WARN_ON_ONCE(winner)) {
-			transaction_put(winner);
-			return -EUCLEAN;
+		winner = transaction_check_asymmetric_conflict(&state->transaction_object, access, can_sleep, &ret);
+		if (winner) {
+			if (!waiter) {
+				transaction_put(winner);
+				return -EWOULDBLOCK;
+			}
+			*waiter = winner;
+			return -EAGAIN;
 		}
 		spin_lock(&state->transaction_object.lock);
 		tx_hlist_refresh_mode(state);
@@ -608,6 +651,11 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 	node->commit = tx_hlist_commit;
 	node->abort = tx_hlist_abort;
 	node->release = tx_hlist_release;
+	node->blocking_lock_id = workset->callbacks.lock_id;
+	node->nonblocking_lock_id = state->bit_locked ? state->owner :
+		((struct tx_hlist_head *)state->owner)->lock;
+	node->nonblocking_nest_lock = state->bit_locked ? NULL :
+		((struct tx_hlist_head *)state->owner)->lock;
 	ret = transaction_list_workset_add(transaction, node);
 	if (ret)
 		goto free_node;
@@ -646,18 +694,81 @@ static int tx_hlist_contend_ref(struct tx_hlist_ref_state *cursor) {
 }
 
 // Clear an aborted speculative owner before an ordinary update reuses the ref.
-static int tx_hlist_take_ref_ordinary(struct tx_hlist_ref_state *cursor) {
+static int tx_hlist_take_ref_ordinary(struct tx_hlist_ref_state *cursor, bool can_sleep,
+				      struct transaction **waiter) {
+	struct transaction *owner = cursor->transaction;
+	bool should_sleep = false;
 	int ret;
 
-	if (!cursor->transaction)
+	if (!owner)
 		return 0;
-	ret = abort_transaction(cursor->transaction);
+	if (can_sleep && transaction_contention_manager(owner, NULL, &should_sleep) && should_sleep) {
+		if (!waiter)
+			return -EWOULDBLOCK;
+		*waiter = transaction_get(owner);
+		return -EAGAIN;
+	}
+	ret = abort_transaction(owner);
 	if (ret)
 		return ret;
 	cursor->transaction = NULL;
 	cursor->sentry = NULL;
 	return 0;
 }
+
+int tx_hlist_prepare(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head,
+		     enum transaction_access_mode mode) {
+	struct transaction *waiter;
+	int ret;
+
+	if (current_transaction())
+		return 0;
+retry:
+	waiter = NULL;
+	spin_lock(head->lock);
+	ret = tx_hlist_acquire(&head->state, mode, true, &waiter, NULL);
+	if (!ret && ref) {
+		spin_lock(&ref->state.lock);
+		ret = tx_hlist_take_ref_ordinary(&ref->state, true, &waiter);
+		spin_unlock(&ref->state.lock);
+	}
+	spin_unlock(head->lock);
+	if (waiter) {
+		ret = transaction_wait_on_conflict(waiter);
+		if (!ret)
+			goto retry;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_prepare);
+
+int tx_hlist_bl_prepare(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head,
+			enum transaction_access_mode mode) {
+	struct tx_hlist_head_state *state;
+	struct transaction *waiter;
+	int ret;
+
+	if (current_transaction())
+		return 0;
+retry:
+	waiter = NULL;
+	hlist_bl_lock(&head->head);
+	state = tx_hlist_bl_state(head, false);
+	ret = state ? tx_hlist_acquire(state, mode, true, &waiter, NULL) : 0;
+	if (!ret && ref) {
+		spin_lock(&ref->state.lock);
+		ret = tx_hlist_take_ref_ordinary(&ref->state, true, &waiter);
+		spin_unlock(&ref->state.lock);
+	}
+	hlist_bl_unlock(&head->head);
+	if (waiter) {
+		ret = transaction_wait_on_conflict(waiter);
+		if (!ret)
+			goto retry;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_prepare);
 
 static struct tx_hlist_spec_entry *tx_hlist_publish_spec(struct tx_hlist_spec_entry *entry,
 						  struct tx_hlist_ref_state *cursor,
@@ -685,7 +796,8 @@ static struct tx_hlist_spec_entry *tx_hlist_publish_spec(struct tx_hlist_spec_en
 }
 
 static int tx_hlist_add_locked_common(struct tx_hlist_ref_state *cursor,
-				      struct tx_hlist_head_state *parent) {
+				      struct tx_hlist_head_state *parent, bool can_sleep,
+				      struct transaction **waiter) {
 	struct transaction *transaction = current_transaction();
 	struct tx_hlist_workset *workset;
 	struct tx_hlist_spec_entry *entry;
@@ -694,7 +806,7 @@ static int tx_hlist_add_locked_common(struct tx_hlist_ref_state *cursor,
 	if (cursor->bit_locked != parent->bit_locked)
 		return -EINVAL;
 	tx_hlist_assert_locked(parent);
-	ret = tx_hlist_acquire(parent, TRANSACTION_ACCESS_READ_WRITE, &workset);
+	ret = tx_hlist_acquire(parent, TRANSACTION_ACCESS_READ_WRITE, can_sleep, waiter, &workset);
 	if (ret)
 		return ret;
 	spin_lock(&cursor->lock);
@@ -717,7 +829,7 @@ static int tx_hlist_add_locked_common(struct tx_hlist_ref_state *cursor,
 		goto out;
 	}
 
-	ret = tx_hlist_take_ref_ordinary(cursor);
+	ret = tx_hlist_take_ref_ordinary(cursor, can_sleep, waiter);
 	if (ret)
 		goto out;
 	if (!tx_hlist_ref_unhashed(cursor)) {
@@ -823,6 +935,7 @@ static int tx_hlist_move_common(struct tx_hlist_ref_state *cursor, struct tx_hli
 	struct tx_hlist_head_state *second;
 	struct tx_hlist_spec_entry *entry;
 	struct tx_hlist_head_callbacks protocol;
+	struct transaction *waiter = NULL;
 	bool protocol_acquired;
 	int ret;
 
@@ -869,14 +982,16 @@ retry:
 	}
 
 	if (source) {
-		ret = tx_hlist_acquire(source, TRANSACTION_ACCESS_READ_WRITE, &source_workset);
+		ret = tx_hlist_acquire(source, TRANSACTION_ACCESS_READ_WRITE,
+				       !transaction && !protocol_held, &waiter, &source_workset);
 		if (ret)
 			goto unlock;
 	}
 	if (destination == source) {
 		destination_workset = source_workset;
 	} else {
-		ret = tx_hlist_acquire(destination, TRANSACTION_ACCESS_READ_WRITE, &destination_workset);
+		ret = tx_hlist_acquire(destination, TRANSACTION_ACCESS_READ_WRITE,
+				       !transaction && !protocol_held, &waiter, &destination_workset);
 		if (ret)
 			goto unlock;
 	}
@@ -918,7 +1033,7 @@ retry:
 		goto unlock_cursor;
 	}
 
-	ret = tx_hlist_take_ref_ordinary(cursor);
+	ret = tx_hlist_take_ref_ordinary(cursor, !protocol_held, &waiter);
 	if (ret)
 		goto unlock_cursor;
 	if (!tx_hlist_ref_unhashed(cursor))
@@ -933,6 +1048,14 @@ unlock:
 	tx_hlist_unlock_pair(first, second);
 	if (protocol_acquired)
 		protocol.unlock(protocol.owner);
+	if (waiter) {
+		int wait_ret = transaction_wait_on_conflict(waiter);
+
+		waiter = NULL;
+		if (!wait_ret)
+			goto retry;
+		ret = wait_ret;
+	}
 free_entries:
 	if (first_entry)
 		tx_hlist_spec_free(first_entry);
@@ -941,7 +1064,8 @@ free_entries:
 	return ret;
 }
 
-static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor) {
+static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor, bool can_sleep,
+				      struct transaction **waiter) {
 	struct tx_hlist_head_state *parent = tx_hlist_logical_parent(cursor);
 	struct transaction *transaction = current_transaction();
 	struct tx_hlist_workset *workset;
@@ -951,7 +1075,7 @@ static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor) {
 	if (!parent)
 		return 0;
 	tx_hlist_assert_locked(parent);
-	ret = tx_hlist_acquire(parent, TRANSACTION_ACCESS_READ_WRITE, &workset);
+	ret = tx_hlist_acquire(parent, TRANSACTION_ACCESS_READ_WRITE, can_sleep, waiter, &workset);
 	if (ret)
 		return ret;
 	spin_lock(&cursor->lock);
@@ -987,7 +1111,7 @@ static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor) {
 		goto out;
 	}
 
-	ret = tx_hlist_take_ref_ordinary(cursor);
+	ret = tx_hlist_take_ref_ordinary(cursor, can_sleep, waiter);
 	if (ret)
 		goto out;
 	if (!tx_hlist_ref_unhashed(cursor))
@@ -999,38 +1123,54 @@ out:
 }
 
 int tx_hlist_add_head_locked(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head) {
-	return tx_hlist_add_locked_common(&ref->state, &head->state);
+	return tx_hlist_add_locked_common(&ref->state, &head->state, false, NULL);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_add_head_locked);
 
 int tx_hlist_add_head(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head) {
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	spin_lock(head->lock);
-	ret = tx_hlist_add_head_locked(ref, head);
+	ret = tx_hlist_add_locked_common(&ref->state, &head->state, true, &waiter);
 	spin_unlock(head->lock);
+	if (waiter) {
+		ret = transaction_wait_on_conflict(waiter);
+		if (!ret)
+			goto retry;
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tx_hlist_add_head);
 
 int tx_hlist_del_locked(struct tx_hlist_entry_ref *ref) {
-	return tx_hlist_del_locked_common(&ref->state);
+	return tx_hlist_del_locked_common(&ref->state, false, NULL);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_del_locked);
 
 int tx_hlist_del(struct tx_hlist_entry_ref *ref) {
 	struct tx_hlist_head_state *parent;
 	struct tx_hlist_head *head;
+	struct transaction *waiter;
 	int ret;
 
 	do {
+		waiter = NULL;
 		parent = tx_hlist_logical_parent(&ref->state);
 		if (!parent)
 			return 0;
 		head = parent->owner;
 		spin_lock(head->lock);
-		ret = tx_hlist_del_locked(ref);
+		ret = tx_hlist_del_locked_common(&ref->state, true, &waiter);
 		spin_unlock(head->lock);
+		if (waiter) {
+			ret = transaction_wait_on_conflict(waiter);
+			if (ret)
+				return ret;
+			ret = -EAGAIN;
+		}
 	} while (ret == -EAGAIN);
 	return ret;
 }
@@ -1046,43 +1186,138 @@ bool tx_hlist_unreferenced(struct tx_hlist_entry_ref *ref) {
 }
 EXPORT_SYMBOL_GPL(tx_hlist_unreferenced);
 
+bool tx_hlist_visible_unhashed(struct tx_hlist_entry_ref *ref) {
+	struct transaction *transaction = current_transaction();
+	bool unhashed;
+
+	if (!transaction)
+		return hlist_unhashed(&ref->node);
+	spin_lock(&ref->state.lock);
+	if (ref->state.transaction == transaction && ref->state.sentry)
+		unhashed = ref->state.sentry->state == TX_HLIST_TRANSACTIONAL_DEL;
+	else
+		unhashed = hlist_unhashed(&ref->node);
+	spin_unlock(&ref->state.lock);
+	return unhashed;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_visible_unhashed);
+
 int tx_hlist_bl_add_head_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head) {
 	struct tx_hlist_head_state *state = tx_hlist_bl_state(head, true);
 
 	if (IS_ERR(state))
 		return PTR_ERR(state);
-	return tx_hlist_add_locked_common(&ref->state, state);
+	return tx_hlist_add_locked_common(&ref->state, state, false, NULL);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_add_head_locked);
 
+int tx_hlist_bl_add_head_lazy_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head) {
+	struct tx_hlist_head_state *state;
+	bool owned;
+
+	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
+		return -EINVAL;
+	state = tx_hlist_bl_state(head, current_transaction() != NULL);
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+	if (state)
+		return tx_hlist_add_locked_common(&ref->state, state, false, NULL);
+
+	spin_lock(&ref->state.lock);
+	owned = ref->state.transaction != NULL;
+	if (!owned && !hlist_bl_unhashed(&ref->node)) {
+		spin_unlock(&ref->state.lock);
+		return -EEXIST;
+	}
+	if (!owned) {
+		hlist_bl_add_head_rcu(&ref->node, &head->head);
+		ref->state.parent = NULL;
+		spin_unlock(&ref->state.lock);
+		return 0;
+	}
+	spin_unlock(&ref->state.lock);
+
+	state = tx_hlist_bl_state(head, true);
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+	return tx_hlist_add_locked_common(&ref->state, state, false, NULL);
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_add_head_lazy_locked);
+
 int tx_hlist_bl_add_head(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head) {
+	struct tx_hlist_head_state *state;
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	hlist_bl_lock(&head->head);
-	ret = tx_hlist_bl_add_head_locked(ref, head);
+	state = tx_hlist_bl_state(head, true);
+	ret = IS_ERR(state) ? PTR_ERR(state) :
+		tx_hlist_add_locked_common(&ref->state, state, true, &waiter);
 	hlist_bl_unlock(&head->head);
+	if (waiter) {
+		ret = transaction_wait_on_conflict(waiter);
+		if (!ret)
+			goto retry;
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_add_head);
 
 int tx_hlist_bl_del_locked(struct tx_hlist_bl_entry_ref *ref) {
-	return tx_hlist_del_locked_common(&ref->state);
+	return tx_hlist_del_locked_common(&ref->state, false, NULL);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_del_locked);
+
+int tx_hlist_bl_del_head_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_head *head) {
+	struct tx_hlist_head_state *state;
+
+	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
+		return -EINVAL;
+	state = tx_hlist_bl_state(head, current_transaction() != NULL);
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+	if (!state) {
+		spin_lock(&ref->state.lock);
+		if (!hlist_bl_unhashed(&ref->node)) {
+			__hlist_bl_del(&ref->node);
+			WRITE_ONCE(ref->node.pprev, NULL);
+		}
+		ref->state.parent = NULL;
+		spin_unlock(&ref->state.lock);
+		return 0;
+	}
+
+	spin_lock(&ref->state.lock);
+	if (!ref->state.parent && !hlist_bl_unhashed(&ref->node))
+		ref->state.parent = state;
+	spin_unlock(&ref->state.lock);
+	return tx_hlist_del_locked_common(&ref->state, false, NULL);
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_del_head_locked);
 
 int tx_hlist_bl_del(struct tx_hlist_bl_entry_ref *ref) {
 	struct tx_hlist_head_state *parent;
 	struct tx_hlist_bl_head *head;
+	struct transaction *waiter;
 	int ret;
 
 	do {
+		waiter = NULL;
 		parent = tx_hlist_logical_parent(&ref->state);
 		if (!parent)
 			return 0;
 		head = parent->owner;
 		hlist_bl_lock(&head->head);
-		ret = tx_hlist_bl_del_locked(ref);
+		ret = tx_hlist_del_locked_common(&ref->state, true, &waiter);
 		hlist_bl_unlock(&head->head);
+		if (waiter) {
+			ret = transaction_wait_on_conflict(waiter);
+			if (ret)
+				return ret;
+			ret = -EAGAIN;
+		}
 	} while (ret == -EAGAIN);
 	return ret;
 }
@@ -1112,13 +1347,37 @@ bool tx_hlist_bl_unreferenced(struct tx_hlist_bl_entry_ref *ref) {
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_unreferenced);
 
+bool tx_hlist_bl_visible_unhashed(struct tx_hlist_bl_entry_ref *ref) {
+	struct transaction *transaction = current_transaction();
+	bool unhashed;
+
+	if (!transaction)
+		return hlist_bl_unhashed(&ref->node);
+	spin_lock(&ref->state.lock);
+	if (ref->state.transaction == transaction && ref->state.sentry)
+		unhashed = ref->state.sentry->state == TX_HLIST_TRANSACTIONAL_DEL;
+	else
+		unhashed = hlist_bl_unhashed(&ref->node);
+	spin_unlock(&ref->state.lock);
+	return unhashed;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_visible_unhashed);
+
 int tx_hlist_get_iterator(struct tx_hlist_iterator *iter, struct tx_hlist_head *head) {
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	spin_lock(head->lock);
-	ret = tx_hlist_acquire(&head->state, TRANSACTION_ACCESS_READ, NULL);
+	ret = tx_hlist_acquire(&head->state, TRANSACTION_ACCESS_READ, true, &waiter, NULL);
 	if (ret) {
 		spin_unlock(head->lock);
+		if (waiter) {
+			ret = transaction_wait_on_conflict(waiter);
+			if (!ret)
+				goto retry;
+		}
 		return ret;
 	}
 	iter->head = head;
@@ -1130,10 +1389,29 @@ int tx_hlist_get_iterator(struct tx_hlist_iterator *iter, struct tx_hlist_head *
 }
 EXPORT_SYMBOL_GPL(tx_hlist_get_iterator);
 
+int tx_hlist_get_iterator_locked(struct tx_hlist_iterator *iter, struct tx_hlist_head *head) {
+	int ret;
+
+	lockdep_assert_held(head->lock);
+	ret = tx_hlist_acquire(&head->state, TRANSACTION_ACCESS_READ, false, NULL, NULL);
+	if (ret)
+		return ret;
+	iter->head = head;
+	iter->spec_next = head->state.spec_list.next;
+	iter->stable_next = head->head.first;
+	iter->cursor = NULL;
+	iter->stable = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_get_iterator_locked);
+
 void tx_hlist_put_iterator(struct tx_hlist_iterator *iter) {
 	spin_unlock(iter->head->lock);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_put_iterator);
+
+void tx_hlist_put_iterator_locked(struct tx_hlist_iterator *iter) { }
+EXPORT_SYMBOL_GPL(tx_hlist_put_iterator_locked);
 
 bool tx_hlist_iter_next(struct tx_hlist_iterator *iter) {
 	struct transaction *transaction = current_transaction();
@@ -1172,6 +1450,51 @@ bool tx_hlist_iter_next(struct tx_hlist_iterator *iter) {
 }
 EXPORT_SYMBOL_GPL(tx_hlist_iter_next);
 
+struct tx_hlist_entry_ref *tx_hlist_first_locked(struct tx_hlist_head *head) {
+	struct tx_hlist_iterator iter;
+	struct tx_hlist_entry_ref *ref = NULL;
+	int ret;
+
+	ret = tx_hlist_get_iterator_locked(&iter, head);
+	if (ret) {
+		if (current_transaction())
+			abort_transaction(current_transaction());
+		return NULL;
+	}
+	if (tx_hlist_iter_next(&iter))
+		ref = iter.cursor;
+	tx_hlist_put_iterator_locked(&iter);
+	return ref;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_first_locked);
+
+struct tx_hlist_entry_ref *tx_hlist_next_locked(struct tx_hlist_entry_ref *ref) {
+	struct tx_hlist_head_state *parent = tx_hlist_logical_parent(&ref->state);
+	struct tx_hlist_iterator iter;
+	bool found = false;
+	int ret;
+
+	if (!parent || parent->bit_locked)
+		return NULL;
+	ret = tx_hlist_get_iterator_locked(&iter, parent->owner);
+	if (ret) {
+		if (current_transaction())
+			abort_transaction(current_transaction());
+		return NULL;
+	}
+	while (tx_hlist_iter_next(&iter)) {
+		if (found) {
+			ref = iter.cursor;
+			tx_hlist_put_iterator_locked(&iter);
+			return ref;
+		}
+		found = iter.cursor == ref;
+	}
+	tx_hlist_put_iterator_locked(&iter);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_next_locked);
+
 int tx_hlist_empty(struct tx_hlist_head *head) {
 	struct tx_hlist_iterator iter;
 	int ret;
@@ -1187,17 +1510,25 @@ EXPORT_SYMBOL_GPL(tx_hlist_empty);
 
 int tx_hlist_bl_get_iterator(struct tx_hlist_bl_iterator *iter, struct tx_hlist_bl_head *head) {
 	struct tx_hlist_head_state *state;
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	hlist_bl_lock(&head->head);
 	state = tx_hlist_bl_state(head, true);
 	if (IS_ERR(state)) {
 		hlist_bl_unlock(&head->head);
 		return PTR_ERR(state);
 	}
-	ret = tx_hlist_acquire(state, TRANSACTION_ACCESS_READ, NULL);
+	ret = tx_hlist_acquire(state, TRANSACTION_ACCESS_READ, true, &waiter, NULL);
 	if (ret) {
 		hlist_bl_unlock(&head->head);
+		if (waiter) {
+			ret = transaction_wait_on_conflict(waiter);
+			if (!ret)
+				goto retry;
+		}
 		return ret;
 	}
 	iter->head = head;
@@ -1210,10 +1541,35 @@ int tx_hlist_bl_get_iterator(struct tx_hlist_bl_iterator *iter, struct tx_hlist_
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_get_iterator);
 
+int tx_hlist_bl_get_iterator_locked(struct tx_hlist_bl_iterator *iter, struct tx_hlist_bl_head *head) {
+	struct tx_hlist_head_state *state;
+	int ret;
+
+	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
+		return -EINVAL;
+	state = tx_hlist_bl_state(head, true);
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+	ret = tx_hlist_acquire(state, TRANSACTION_ACCESS_READ, false, NULL, NULL);
+	if (ret)
+		return ret;
+	iter->head = head;
+	iter->state = state;
+	iter->spec_next = state->spec_list.next;
+	iter->stable_next = hlist_bl_first(&head->head);
+	iter->cursor = NULL;
+	iter->stable = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tx_hlist_bl_get_iterator_locked);
+
 void tx_hlist_bl_put_iterator(struct tx_hlist_bl_iterator *iter) {
 	hlist_bl_unlock(&iter->head->head);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_put_iterator);
+
+void tx_hlist_bl_put_iterator_locked(struct tx_hlist_bl_iterator *iter) { }
+EXPORT_SYMBOL_GPL(tx_hlist_bl_put_iterator_locked);
 
 bool tx_hlist_bl_iter_next(struct tx_hlist_bl_iterator *iter) {
 	struct transaction *transaction = current_transaction();

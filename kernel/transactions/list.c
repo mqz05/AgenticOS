@@ -63,8 +63,17 @@ EXPORT_SYMBOL_GPL(INIT_TX_LIST2_REF);
    runs with the list serialized. */
 static int tx_list2_lock(struct txobj_thread_list_node * node, int blocking) {
 	struct tx_list2_head *head = node->orig_obj;
-	if (!blocking)
+	struct txobj_thread_list_node *previous;
+
+	if (!blocking) {
+		for (previous = node->ordered_lock_prev; previous; previous = previous->ordered_lock_prev) {
+			if (previous->nonblocking_lock_acquired && previous->nonblocking_nest_lock) {
+				spin_lock_nest_lock(&head->lock, previous->nonblocking_nest_lock);
+				return 0;
+			}
+		}
 		spin_lock(&head->lock);
+	}
 	return 0;
 }
 
@@ -231,6 +240,8 @@ static int tx_list2_acquire(struct tx_list2_head * head, enum transaction_access
 	node->unlock = tx_list2_unlock;
 	node->commit = tx_list2_commit;
 	node->abort = tx_list2_abort;
+	node->nonblocking_lock_id = &head->lock;
+	node->nonblocking_nest_lock = &head->lock;
 	ret = transaction_list_workset_add(transaction, node);
 	if (ret)
 		goto free_node;
