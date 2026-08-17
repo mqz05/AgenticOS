@@ -610,7 +610,10 @@ int transaction_inode_snapshot_truncate(struct inode *inode, loff_t oldsize,
 	if (!inode || newsize >= oldsize)
 		return 0;
 
-	shadow_inode = transaction_inode_shadow(inode);
+	if (!current_transaction())
+		return 0;
+
+	shadow_inode = transaction_inode_get(inode, TRANSACTION_ACCESS_READ_WRITE);
 	if (!shadow_inode)
 		return 0;
 	if (IS_ERR(shadow_inode))

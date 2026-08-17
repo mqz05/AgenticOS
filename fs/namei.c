@@ -3750,7 +3750,7 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 		dput(dentry);
 		dentry = NULL;
 	}
-	if (dentry->d_inode) {
+	if (d_inode(dentry)) {
 		/* Cached positive dentry: will open in f_op->open */
 		return dentry;
 	}
@@ -3804,7 +3804,7 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 	}
 
 	/* Negative dentry, just create the file */
-	if (!dentry->d_inode && (open_flag & O_CREAT)) {
+	if (!d_inode(dentry) && (open_flag & O_CREAT)) {
 		file->f_mode |= FMODE_CREATED;
 		audit_inode_child(dir_inode, dentry, AUDIT_TYPE_CHILD_CREATE);
 		if (!dir_inode->i_op->create) {
@@ -3817,7 +3817,7 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 		if (error)
 			goto out_dput;
 	}
-	if (unlikely(create_error) && !dentry->d_inode) {
+	if (unlikely(create_error) && !d_inode(dentry)) {
 		error = create_error;
 		goto out_dput;
 	}
@@ -3855,7 +3855,7 @@ static struct dentry *lookup_fast_for_open(struct nameidata *nd, int open_flag)
 
 	if (open_flag & O_CREAT) {
 		/* Discard negative dentries. Need inode_lock to do the create */
-		if (!dentry->d_inode) {
+		if (!d_inode(dentry)) {
 			if (!(nd->flags & LOOKUP_RCU))
 				dput(dentry);
 			dentry = NULL;
