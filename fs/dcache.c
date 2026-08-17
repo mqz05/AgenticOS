@@ -3376,7 +3376,7 @@ static inline int __d_add(struct dentry *dentry, struct inode *inode,
 		return -ECANCELED;
 	}
 	if (unlikely(d_in_lookup(dentry))) {
-		dir = dentry->d_parent->d_inode;
+		dir = d_inode(dentry->d_parent);
 		n = start_dir_add(dir);
 		d_wait = __d_lookup_unhash(dentry);
 	}
