@@ -606,8 +606,9 @@ int transaction_inode_snapshot_truncate(struct inode *inode, loff_t oldsize,
 {
 	struct _inode *shadow_inode;
 	loff_t snapshot_start;
+	int ret;
 
-	if (!inode || newsize >= oldsize)
+	if (!inode)
 		return 0;
 
 	if (!current_transaction())
@@ -619,9 +620,15 @@ int transaction_inode_snapshot_truncate(struct inode *inode, loff_t oldsize,
 	if (IS_ERR(shadow_inode))
 		return PTR_ERR(shadow_inode);
 
-	snapshot_start = round_down(newsize, PAGE_SIZE);
-	return transaction_inode_pagecache_snapshot_range(shadow_inode, inode,
-							  snapshot_start, oldsize);
+	if (newsize < oldsize) {
+		snapshot_start = round_down(newsize, PAGE_SIZE);
+		ret = transaction_inode_pagecache_snapshot_range(shadow_inode, inode,
+								 snapshot_start, oldsize);
+		if (ret)
+			return ret;
+	}
+	shadow_inode->i_size = newsize;
+	return 1;
 }
 EXPORT_SYMBOL_GPL(transaction_inode_snapshot_truncate);
 

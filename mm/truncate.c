@@ -818,8 +818,10 @@ void truncate_setsize(struct inode *inode, loff_t newsize)
 {
 	loff_t oldsize = inode->i_size;
 	loff_t tx_oldsize = i_size_read(inode);
+	int tx_ret;
 
-	if (transaction_inode_snapshot_truncate(inode, tx_oldsize, newsize))
+	tx_ret = transaction_inode_snapshot_truncate(inode, tx_oldsize, newsize);
+	if (tx_ret)
 		return;
 
 	i_size_write(inode, newsize);

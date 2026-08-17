@@ -3278,7 +3278,7 @@ retry:
 	hlist_bl_for_each_entry(dentry, node, b, d_u.d_in_lookup_hash) {
 		if (dentry->d_name.hash != hash)
 			continue;
-		if (dentry->d_parent != parent)
+		if (dentry_visible_parent(dentry) != parent)
 			continue;
 		if (!d_same_name(dentry, parent, name))
 			continue;
@@ -3304,7 +3304,7 @@ retry:
 		 */
 		if (unlikely(dentry->d_name.hash != hash))
 			goto mismatch;
-		if (unlikely(dentry->d_parent != parent))
+		if (unlikely(dentry_visible_parent(dentry) != parent))
 			goto mismatch;
 		if (unlikely(d_unhashed(dentry)))
 			goto mismatch;
@@ -3339,7 +3339,7 @@ static wait_queue_head_t *__d_lookup_unhash(struct dentry *dentry)
 
 	lockdep_assert_held(&dentry->d_lock);
 
-	b = in_lookup_hash(dentry->d_parent, dentry->d_name.hash);
+	b = in_lookup_hash(dentry_visible_parent(dentry), dentry->d_name.hash);
 	hlist_bl_lock(b);
 	dentry->d_flags &= ~DCACHE_PAR_LOOKUP;
 	__hlist_bl_del(&dentry->d_u.d_in_lookup_hash);
