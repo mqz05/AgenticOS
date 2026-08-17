@@ -1085,9 +1085,11 @@ free_entries:
 	return ret;
 }
 
-static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor, bool can_sleep,
-				      struct transaction **waiter) {
-	struct tx_hlist_head_state *parent = tx_hlist_logical_parent(cursor);
+static int __tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor,
+					struct tx_hlist_head_state *locked_parent,
+					bool can_sleep,
+					struct transaction **waiter) {
+	struct tx_hlist_head_state *parent = locked_parent ?: tx_hlist_logical_parent(cursor);
 	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_workset *workset;
 	struct tx_hlist_spec_entry *entry;
@@ -1100,7 +1102,7 @@ static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor, bool ca
 	if (ret)
 		return ret;
 	spin_lock(&cursor->lock);
-	if (tx_hlist_logical_parent_locked(cursor) != parent) {
+	if (!locked_parent && tx_hlist_logical_parent_locked(cursor) != parent) {
 		ret = -EAGAIN;
 		goto out;
 	}
@@ -1141,6 +1143,11 @@ static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor, bool ca
 out:
 	spin_unlock(&cursor->lock);
 	return ret;
+}
+
+static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor, bool can_sleep,
+				      struct transaction **waiter) {
+	return __tx_hlist_del_locked_common(cursor, NULL, can_sleep, waiter);
 }
 
 int tx_hlist_add_head_locked(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head) {
@@ -1314,7 +1321,7 @@ int tx_hlist_bl_del_head_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hli
 	if (!ref->state.parent && !hlist_bl_unhashed(&ref->node))
 		ref->state.parent = state;
 	spin_unlock(&ref->state.lock);
-	return tx_hlist_del_locked_common(&ref->state, false, NULL);
+	return __tx_hlist_del_locked_common(&ref->state, state, false, NULL);
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_del_head_locked);
 
