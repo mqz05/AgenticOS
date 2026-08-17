@@ -162,7 +162,6 @@ static int transaction_inode_pagecache_snapshot(struct _inode *shadow_inode,
 	struct transaction_inode_pagecache_chunk *chunk;
 	struct folio *folio;
 	size_t offset;
-	void *src;
 
 	if (!len || transaction_inode_pagecache_covered(shadow_inode, pos, len))
 		return 0;
@@ -188,9 +187,7 @@ static int transaction_inode_pagecache_snapshot(struct _inode *shadow_inode,
 	chunk->pos = pos;
 	chunk->len = len;
 	offset = pos - folio_pos(folio);
-	src = kmap_local_folio(folio, offset);
-	memcpy(chunk->data, src, len);
-	kunmap_local(src);
+	memcpy_from_folio(chunk->data, folio, offset, len);
 	list_add_tail(&chunk->list, &shadow_inode->tx_pagecache);
 
 	folio_unlock(folio);
@@ -240,7 +237,6 @@ static int transaction_inode_pagecache_restore(struct inode *inode,
 			loff_t pos = chunk->pos + done;
 			size_t offset = pos & (PAGE_SIZE - 1);
 			size_t len = min_t(size_t, chunk->len - done, PAGE_SIZE - offset);
-			void *dst;
 
 			folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT,
 						    FGP_WRITEBEGIN, mapping_gfp_mask(mapping));
@@ -254,10 +250,9 @@ static int transaction_inode_pagecache_restore(struct inode *inode,
 				folio_mark_uptodate(folio);
 			}
 
-			dst = kmap_local_folio(folio, offset);
-			memcpy(dst, chunk->data + done, len);
-			kunmap_local(dst);
+			memcpy_to_folio(folio, offset, chunk->data + done, len);
 			flush_dcache_folio(folio);
+			folio_mark_uptodate(folio);
 			folio_mark_dirty(folio);
 			folio_unlock(folio);
 			folio_put(folio);

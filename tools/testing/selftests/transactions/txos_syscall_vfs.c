@@ -107,6 +107,7 @@ static int file_content_is(const char *path, const char *expected)
 	ssize_t len;
 	int close_ret;
 	int fd;
+	int i;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
@@ -130,6 +131,13 @@ static int file_content_is(const char *path, const char *expected)
 		       path, len, expected_len);
 	ksft_print_msg("%s: actual bytes='%.*s' expected='%s'\n",
 		       path, (int)len, buf, expected);
+	ksft_print_msg("%s: actual hex=", path);
+	for (i = 0; i < len; i++)
+		printf("%02x", (unsigned char)buf[i]);
+	printf(" expected hex=");
+	for (i = 0; expected[i]; i++)
+		printf("%02x", (unsigned char)expected[i]);
+	printf("\n");
 	if (stat(path, &st) == 0)
 		ksft_print_msg("%s: stat size=%lld mode=%o nlink=%lu blocks=%lld\n",
 			       path, (long long)st.st_size, st.st_mode & 0777,
@@ -297,15 +305,23 @@ int main(void)
 			 "ftruncate size publish through xend\n");
 
 	if (xbegin() != 0) {
+		ksft_print_msg("create abort: xbegin failed errno=%d (%s)\n",
+			       errno, strerror(errno));
 		ksft_test_result_fail("create rollback through xabort\n");
 		goto out_unlink;
 	}
 	if (create_empty_file("/tmp/txos-create-abort", 0600) != 0) {
+		int create_errno = errno;
+
 		xabort();
+		ksft_print_msg("create abort: open(O_CREAT) failed errno=%d (%s)\n",
+			       create_errno, strerror(create_errno));
 		ksft_test_result_fail("create rollback through xabort\n");
 		goto out_unlink;
 	}
 	if (xabort() != 0) {
+		ksft_print_msg("create abort: xabort failed errno=%d (%s)\n",
+			       errno, strerror(errno));
 		ksft_test_result_fail("create rollback through xabort\n");
 		goto out_unlink;
 	}

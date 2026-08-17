@@ -3812,6 +3812,12 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 			goto out_dput;
 		}
 
+		error = transaction_inode_snapshot(dir_inode);
+		if (error)
+			goto out_dput;
+		error = transaction_dentry_snapshot(dentry);
+		if (error)
+			goto out_dput;
 		error = dir_inode->i_op->create(idmap, dir_inode, dentry,
 						mode, open_flag & O_EXCL);
 		if (error)
