@@ -556,7 +556,9 @@ static int tx_hlist_commit(struct txobj_thread_list_node *node) {
 	return 0;
 }
 
-// Discard speculative records without changing the committed native hlist.
+// Discard speculative records and preserve the committed native hlist.
+// Some callers may physically unhash before abort cleanup; restore those
+// entries from the speculative delete parent so rollback remains visible.
 static int tx_hlist_abort(struct txobj_thread_list_node *node) {
 	struct tx_hlist_head_state *state = tx_hlist_node_state(node);
 	struct transaction *transaction = node->tx;
@@ -571,6 +573,11 @@ static int tx_hlist_abort(struct txobj_thread_list_node *node) {
 		cursor = entry->cursor;
 		spin_lock(&cursor->lock);
 		if (cursor->transaction == transaction && cursor->sentry == entry) {
+			if (entry->state == TX_HLIST_TRANSACTIONAL_DEL &&
+			    entry->parent && tx_hlist_ref_unhashed(cursor)) {
+				tx_hlist_ref_add_head(cursor, entry->parent);
+				cursor->parent = entry->parent;
+			}
 			cursor->transaction = NULL;
 			cursor->sentry = NULL;
 		}
