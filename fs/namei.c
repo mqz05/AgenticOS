@@ -3321,7 +3321,7 @@ static inline int may_create(struct mnt_idmap *idmap,
 			     struct inode *dir, struct dentry *child)
 {
 	audit_inode_child(dir, child, AUDIT_TYPE_CHILD_CREATE);
-	if (child->d_inode)
+	if (d_inode(child))
 		return -EEXIST;
 	if (IS_DEADDIR(dir))
 		return -ENOENT;
@@ -3547,7 +3547,7 @@ static int may_open(struct mnt_idmap *idmap, const struct path *path,
 		    int acc_mode, int flag)
 {
 	struct dentry *dentry = path->dentry;
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = d_inode(dentry);
 	int error;
 
 	if (!inode)
@@ -3605,7 +3605,7 @@ static int may_open(struct mnt_idmap *idmap, const struct path *path,
 static int handle_truncate(struct mnt_idmap *idmap, struct file *filp)
 {
 	const struct path *path = &filp->f_path;
-	struct inode *inode = path->dentry->d_inode;
+	struct inode *inode = d_inode(path->dentry);
 	int error = get_write_access(inode);
 	if (error)
 		return error;

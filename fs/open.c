@@ -41,6 +41,7 @@ int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
 {
 	int ret;
 	struct iattr newattrs;
+	struct inode *inode = d_inode(dentry);
 
 	/* Not pretty: "inode->i_size" shouldn't really be signed. But it is. */
 	if (length < 0)
@@ -60,13 +61,13 @@ int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ret)
 		newattrs.ia_valid |= ret | ATTR_FORCE;
 
-	ret = inode_lock_killable(dentry->d_inode);
+	ret = inode_lock_killable(inode);
 	if (ret)
 		return ret;
 
 	/* Note any delegations or leases have already been broken: */
 	ret = notify_change(idmap, dentry, &newattrs, NULL);
-	inode_unlock(dentry->d_inode);
+	inode_unlock(inode);
 	return ret;
 }
 
@@ -76,7 +77,7 @@ int vfs_truncate(const struct path *path, loff_t length)
 	struct inode *inode;
 	int error;
 
-	inode = path->dentry->d_inode;
+	inode = d_inode(path->dentry);
 
 	/* For directories it's -EISDIR, for other non-regulars - -EINVAL */
 	if (S_ISDIR(inode->i_mode))
@@ -171,7 +172,7 @@ int do_ftruncate(struct file *file, loff_t length, int small)
 		small = 0;
 
 	dentry = file->f_path.dentry;
-	inode = dentry->d_inode;
+	inode = d_inode(dentry);
 	if (!S_ISREG(inode->i_mode) || !(file->f_mode & FMODE_WRITE))
 		return -EINVAL;
 
@@ -904,8 +905,11 @@ static int do_dentry_open(struct file *f,
 			  int (*open)(struct inode *, struct file *))
 {
 	static const struct file_operations empty_fops = {};
-	struct inode *inode = f->f_path.dentry->d_inode;
+	struct inode *inode = d_inode(f->f_path.dentry);
 	int error;
+
+	if (WARN_ON_ONCE(!inode))
+		return -ENOENT;
 
 	path_get(&f->f_path);
 	f->f_inode = inode;
