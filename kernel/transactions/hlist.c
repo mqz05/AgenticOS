@@ -69,6 +69,16 @@ static struct transaction *tx_hlist_current_active_transaction(void)
 	return transaction;
 }
 
+static bool tx_hlist_transaction_finishing(struct transaction *transaction)
+{
+	enum transaction_state status;
+
+	if (!transaction)
+		return false;
+	status = transaction_status(transaction);
+	return status == TRANSACTION_COMMITTING || status == TRANSACTION_ABORTING;
+}
+
 static bool tx_hlist_callbacks_equal(const struct tx_hlist_head_callbacks *first,
 				      const struct tx_hlist_head_callbacks *second) {
 	return first->owner == second->owner && first->get == second->get && first->put == second->put &&
@@ -575,7 +585,7 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 			    bool can_sleep, struct transaction **waiter,
 			    struct tx_hlist_workset **result) {
 	struct txobj_thread_list_node *node;
-	struct transaction *transaction = tx_hlist_current_active_transaction();
+	struct transaction *transaction = current_transaction();
 	struct tx_hlist_workset *workset;
 	struct transaction *winner;
 	enum transaction_access_mode tx_access = TRANSACTION_ACCESS_READ;
@@ -586,6 +596,8 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 		*result = NULL;
 	if (waiter)
 		*waiter = NULL;
+	if (tx_hlist_transaction_finishing(transaction))
+		transaction = NULL;
 	if (!transaction) {
 		winner = transaction_check_asymmetric_conflict(&state->transaction_object, access, can_sleep, &ret);
 		if (winner) {
@@ -601,6 +613,9 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 		spin_unlock(&state->transaction_object.lock);
 		return ret;
 	}
+	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
+		return -ECANCELED;
+
 	if (access == TRANSACTION_ACCESS_READ) {
 		next_mode = TX_HLIST_R;
 		if (state->mode == TX_HLIST_W || state->mode == TX_HLIST_EXCL) {

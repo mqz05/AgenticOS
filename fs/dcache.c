@@ -231,6 +231,11 @@ static int dentry_relations_prepare(struct dentry *dentry) {
 	return 0;
 }
 
+static bool dentry_committed_unhashed(const struct dentry *dentry)
+{
+	return hlist_bl_unhashed(&dentry->d_hash);
+}
+
 static bool dcache_transaction_error(int ret) {
 	struct transaction *transaction;
 
@@ -283,6 +288,11 @@ static void d_children_put(void *owner) {
 static bool dcache_current_transaction_active(void)
 {
 	return false;
+}
+
+static bool dentry_committed_unhashed(const struct dentry *dentry)
+{
+	return hlist_bl_unhashed(&dentry->d_hash);
 }
 
 static int d_hash_add_locked(struct dentry *dentry, struct hlist_bl_head *head) {
@@ -1139,7 +1149,7 @@ static inline bool retain_dentry(struct dentry *dentry, bool locked)
 	d_flags = READ_ONCE(dentry->d_flags);
 
 	// Unreachable? Nobody would be able to look it up, no point retaining
-	if (unlikely(d_unhashed(dentry)))
+	if (unlikely(dentry_committed_unhashed(dentry)))
 		return false;
 
 	// Same if it's disconnected
