@@ -2435,7 +2435,8 @@ static int __d_instantiate(struct dentry *dentry, struct inode *inode)
 	if (!current_transaction() && (dentry->d_flags &
 	     (DCACHE_LRU_LIST | DCACHE_SHRINK_LIST)) == DCACHE_LRU_LIST)
 		this_cpu_dec(nr_dentry_negative);
-	fsnotify_update_flags(dentry);
+	if (!current_transaction())
+		fsnotify_update_flags(dentry);
 	spin_unlock(&dentry->d_lock);
 	return 0;
 }
@@ -3402,7 +3403,8 @@ static inline int __d_add(struct dentry *dentry, struct inode *inode,
 			return ret;
 		}
 		raw_write_seqcount_end(&dentry->d_seq);
-		fsnotify_update_flags(dentry);
+		if (!current_transaction())
+			fsnotify_update_flags(dentry);
 	}
 	__d_rehash(dentry, false);
 	if (dir)

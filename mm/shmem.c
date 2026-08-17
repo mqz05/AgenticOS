@@ -1317,6 +1317,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 	if (S_ISREG(inode->i_mode) && (attr->ia_valid & ATTR_SIZE)) {
 		loff_t oldsize = inode->i_size;
 		loff_t newsize = attr->ia_size;
+		int tx_ret = 0;
 
 		/* protected by i_rwsem */
 		if ((newsize < oldsize && (info->seals & F_SEAL_SHRINK)) ||
@@ -1328,7 +1329,13 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 					oldsize, newsize);
 			if (error)
 				return error;
-			i_size_write(inode, newsize);
+			tx_ret = transaction_inode_snapshot_truncate(inode,
+								     oldsize,
+								     newsize);
+			if (tx_ret < 0)
+				return tx_ret;
+			if (!tx_ret)
+				i_size_write(inode, newsize);
 			update_mtime = true;
 		} else {
 			update_ctime = false;
