@@ -131,6 +131,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 #ifdef CONFIG_TRANSACTIONS
 	.transaction	= NULL,
 	.transaction_entry = LIST_HEAD_INIT(init_task.transaction_entry),
+	.transaction_checkpoint = NULL,
 #endif
 #ifdef CONFIG_IO_URING
 	.io_uring	= NULL,

@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/transaction.h>
+#include <linux/transaction_checkpoint.h>
 
 // The timestamp orders transactions that contend for the same object.
 static atomic64_t timestamp_counter = ATOMIC64_INIT(0);
@@ -314,13 +315,20 @@ EXPORT_SYMBOL_GPL(transaction_put);
 void transaction_task_init(struct task_struct *task) {
 	WRITE_ONCE(task->transaction, NULL);
 	INIT_LIST_HEAD(&task->transaction_entry);
+	WRITE_ONCE(task->transaction_checkpoint, NULL);
 }
 
 int transaction_attach_task(struct transaction *transaction, struct task_struct *task) {
-	int ret = 0;
+	int ret;
 
 	if (!transaction || !task)
 		return -EINVAL;
+	if (READ_ONCE(task->transaction))
+		return -EBUSY;
+
+	ret = transaction_checkpoint_alloc(task);
+	if (ret)
+		return ret == -EALREADY ? -EBUSY : ret;
 
 	spin_lock(&transaction->lock);
 	if (READ_ONCE(task->transaction)) {
@@ -338,6 +346,8 @@ int transaction_attach_task(struct transaction *transaction, struct task_struct 
 	WRITE_ONCE(task->transaction, transaction);
 out:
 	spin_unlock(&transaction->lock);
+	if (ret)
+		transaction_checkpoint_free(task);
 
 	return ret;
 }
@@ -350,8 +360,10 @@ void transaction_detach_task(struct task_struct *task) {
 		return;
 
 	transaction = READ_ONCE(task->transaction);
-	if (!transaction)
+	if (!transaction) {
+		transaction_checkpoint_free(task);
 		return;
+	}
 
 	spin_lock(&transaction->lock);
 	if (READ_ONCE(task->transaction) != transaction) {
@@ -363,6 +375,7 @@ void transaction_detach_task(struct task_struct *task) {
 	list_del_init(&task->transaction_entry);
 	atomic_dec(&transaction->task_count);
 	spin_unlock(&transaction->lock);
+	transaction_checkpoint_free(task);
 	transaction_put(transaction);
 }
 EXPORT_SYMBOL_GPL(transaction_detach_task);
@@ -780,8 +793,10 @@ void transaction_task_exit(struct task_struct *task) {
 		return;
 
 	transaction = READ_ONCE(task->transaction);
-	if (!transaction)
+	if (!transaction) {
+		transaction_checkpoint_free(task);
 		return;
+	}
 
 	if (live_transaction(transaction)) {
 		abort_transaction(transaction);

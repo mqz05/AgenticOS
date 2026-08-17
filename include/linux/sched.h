@@ -87,6 +87,7 @@ struct task_delay_info;
 struct task_group;
 struct task_struct;
 struct transaction;
+struct transaction_checkpoint;
 struct user_event_mm;
 
 #include <linux/sched/ext.h>
@@ -1197,6 +1198,7 @@ struct task_struct {
 	/* System transaction associated with this task. */
 	struct transaction		*transaction;
 	struct list_head		transaction_entry; // Lets transaction->tasks to point back to this task struct
+	struct transaction_checkpoint	*transaction_checkpoint;
 #endif
 
 #ifdef CONFIG_IO_URING
