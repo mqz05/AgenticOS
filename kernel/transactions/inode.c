@@ -298,9 +298,8 @@ static int transaction_inode_lock(struct txobj_thread_list_node *node, int block
 		if (previous->type != TRANSACTION_OBJECT_INODE)
 			continue;
 		if (blocking && previous->blocking_lock_acquired) {
-			struct inode *nest = previous->orig_obj;
-
-			down_write_nest_lock(&inode->i_rwsem, &nest->i_rwsem);
+			down_write_nest_lock(&inode->i_rwsem,
+					     &((struct inode *)previous->orig_obj)->i_rwsem);
 			return 0;
 		}
 		if (!blocking && previous->nonblocking_lock_acquired && previous->nonblocking_nest_lock) {
