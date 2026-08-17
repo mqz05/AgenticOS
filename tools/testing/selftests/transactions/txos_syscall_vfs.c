@@ -102,19 +102,43 @@ static int file_size_is(const char *path, off_t size)
 static int file_content_is(const char *path, const char *expected)
 {
 	char buf[64];
+	struct stat st;
+	size_t expected_len = strlen(expected);
 	ssize_t len;
+	int close_ret;
 	int fd;
 
 	fd = open(path, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
+		ksft_print_msg("%s: open failed errno=%d (%s)\n",
+			       path, errno, strerror(errno));
 		return 0;
+	}
 
 	len = read(fd, buf, sizeof(buf));
-	if (close(fd) != 0 || len < 0)
+	close_ret = close(fd);
+	if (close_ret != 0 || len < 0) {
+		ksft_print_msg("%s: read len=%zd close=%d errno=%d (%s)\n",
+			       path, len, close_ret, errno, strerror(errno));
 		return 0;
+	}
 
-	return (size_t)len == strlen(expected) &&
-	       memcmp(buf, expected, len) == 0;
+	if ((size_t)len == expected_len && memcmp(buf, expected, len) == 0)
+		return 1;
+
+	ksft_print_msg("%s: content mismatch read_len=%zd expected_len=%zu\n",
+		       path, len, expected_len);
+	ksft_print_msg("%s: actual bytes='%.*s' expected='%s'\n",
+		       path, (int)len, buf, expected);
+	if (stat(path, &st) == 0)
+		ksft_print_msg("%s: stat size=%lld mode=%o nlink=%lu blocks=%lld\n",
+			       path, (long long)st.st_size, st.st_mode & 0777,
+			       (unsigned long)st.st_nlink,
+			       (long long)st.st_blocks);
+	else
+		ksft_print_msg("%s: stat failed errno=%d (%s)\n",
+			       path, errno, strerror(errno));
+	return 0;
 }
 
 int main(void)
@@ -285,9 +309,36 @@ int main(void)
 		ksft_test_result_fail("create rollback through xabort\n");
 		goto out_unlink;
 	}
-	ksft_test_result(access("/tmp/txos-create-abort", F_OK) == -1 &&
-			 errno == ENOENT,
-			 "create rollback through xabort\n");
+	{
+		struct stat create_st;
+		int access_errno;
+		int access_ret;
+		int create_ok;
+		int stat_errno;
+		int stat_ret;
+
+		errno = 0;
+		access_ret = access("/tmp/txos-create-abort", F_OK);
+		access_errno = errno;
+		errno = 0;
+		stat_ret = stat("/tmp/txos-create-abort", &create_st);
+		stat_errno = errno;
+		create_ok = access_ret == -1 && access_errno == ENOENT;
+		if (!create_ok) {
+			ksft_print_msg("create abort: access_ret=%d errno=%d (%s) stat_ret=%d errno=%d (%s)\n",
+				       access_ret, access_errno,
+				       strerror(access_errno), stat_ret,
+				       stat_errno, strerror(stat_errno));
+			if (stat_ret == 0)
+				ksft_print_msg("create abort: mode=%o size=%lld nlink=%lu blocks=%lld\n",
+					       create_st.st_mode & 0777,
+					       (long long)create_st.st_size,
+					       (unsigned long)create_st.st_nlink,
+					       (long long)create_st.st_blocks);
+		}
+		ksft_test_result(create_ok,
+				 "create rollback through xabort\n");
+	}
 
 	create_empty_file("/tmp/txos-unlink-abort", 0600);
 	if (xbegin() != 0) {
