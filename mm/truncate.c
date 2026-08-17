@@ -20,6 +20,7 @@
 #include <linux/pagevec.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/shmem_fs.h>
+#include <linux/transaction.h>
 #include <linux/rmap.h>
 #include "internal.h"
 
@@ -816,6 +817,10 @@ EXPORT_SYMBOL(truncate_pagecache);
 void truncate_setsize(struct inode *inode, loff_t newsize)
 {
 	loff_t oldsize = inode->i_size;
+	loff_t tx_oldsize = i_size_read(inode);
+
+	if (transaction_inode_snapshot_truncate(inode, tx_oldsize, newsize))
+		return;
 
 	i_size_write(inode, newsize);
 	if (newsize > oldsize)

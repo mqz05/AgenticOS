@@ -4,10 +4,36 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/fs.h>
+#include <linux/highmem.h>
 #include <linux/mnt_idmapping.h>
+#include <linux/pagemap.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/transaction.h>
+
+struct transaction_inode_pagecache_chunk {
+	struct list_head list;
+	loff_t pos;
+	size_t len;
+	u8 data[];
+};
+
+static void transaction_inode_pagecache_init(struct _inode * inode) {
+	INIT_LIST_HEAD(&inode->tx_pagecache);
+}
+
+static void transaction_inode_pagecache_free(struct _inode * inode) {
+	struct transaction_inode_pagecache_chunk *chunk;
+	struct transaction_inode_pagecache_chunk *next;
+
+	if (!inode)
+		return;
+
+	list_for_each_entry_safe(chunk, next, &inode->tx_pagecache, list) {
+		list_del(&chunk->list);
+		kfree(chunk);
+	}
+}
 
 static void transaction_inode_contents_free(struct rcu_head *rcu) {
 	struct _inode *inode = container_of(rcu, struct _inode, i_rcu);
@@ -18,6 +44,7 @@ static void transaction_inode_contents_free(struct rcu_head *rcu) {
 static void transaction_inode_contents_put(struct _inode *inode) {
 	if (!inode || !refcount_dec_and_test(&inode->tx_refcount))
 		return;
+	transaction_inode_pagecache_free(inode);
 	if (!inode->embedded)
 		call_rcu(&inode->i_rcu, transaction_inode_contents_free);
 }
@@ -31,6 +58,8 @@ static void transaction_inode_copy_from_stable(struct _inode *contents, struct i
 	contents->i_flags = inode->i_flags;
 	contents->i_nlink = inode->i_nlink;
 	contents->i_size = __i_size_read(inode);
+	contents->i_blocks = inode->i_blocks;
+	contents->i_bytes = inode->i_bytes;
 	atomic64_set(&contents->i_version, atomic64_read(&inode->i_version));
 	contents->i_atime_sec = inode->i_atime_sec;
 	contents->i_mtime_sec = inode->i_mtime_sec;
@@ -38,6 +67,7 @@ static void transaction_inode_copy_from_stable(struct _inode *contents, struct i
 	contents->i_atime_nsec = inode->i_atime_nsec;
 	contents->i_mtime_nsec = inode->i_mtime_nsec;
 	contents->i_ctime_nsec = inode->i_ctime_nsec;
+	transaction_inode_pagecache_init(contents);
 }
 
 static struct _inode *transaction_inode_committed_locked(struct inode *inode) {
@@ -71,6 +101,7 @@ int transaction_inode_replace_committed_locked(struct transaction_object *object
 	refcount_set(&replacement->tx_refcount, 1);
 	memset(&replacement->i_rcu, 0, sizeof(replacement->i_rcu));
 	replacement->embedded = false;
+	transaction_inode_pagecache_init(replacement);
 	rcu_assign_pointer(inode->i_contents, replacement);
 	transaction_inode_contents_put(committed);
 	return 0;
@@ -85,12 +116,14 @@ static void transaction_inode_shadow_copy(struct _inode *shadow_inode,
 	refcount_set(&shadow_inode->tx_refcount, 1);
 	memset(&shadow_inode->i_rcu, 0, sizeof(shadow_inode->i_rcu));
 	shadow_inode->embedded = false;
+	transaction_inode_pagecache_init(shadow_inode);
 }
 
 static bool transaction_inode_matches_stable(struct _inode *contents, struct inode *inode) {
 	return contents->i_mode == inode->i_mode && uid_eq(contents->i_uid, inode->i_uid) &&
 	       gid_eq(contents->i_gid, inode->i_gid) && contents->i_flags == inode->i_flags &&
 	       contents->i_nlink == inode->i_nlink && contents->i_size == __i_size_read(inode) &&
+	       contents->i_blocks == inode->i_blocks && contents->i_bytes == inode->i_bytes &&
 	       atomic64_read(&contents->i_version) == atomic64_read(&inode->i_version) &&
 	       contents->i_atime_sec == inode->i_atime_sec &&
 	       contents->i_mtime_sec == inode->i_mtime_sec &&
@@ -106,6 +139,136 @@ static void transaction_inode_private_put(struct _inode *shadow_inode) {
 	transaction_inode_contents_put(shadow_inode->shadow);
 	shadow_inode->shadow = NULL;
 	transaction_inode_contents_put(shadow_inode);
+}
+
+static bool transaction_inode_pagecache_covered(struct _inode *shadow_inode,
+						loff_t pos, size_t len)
+{
+	struct transaction_inode_pagecache_chunk *chunk;
+	loff_t end = pos + len;
+
+	list_for_each_entry(chunk, &shadow_inode->tx_pagecache, list) {
+		if (chunk->pos <= pos && chunk->pos + chunk->len >= end)
+			return true;
+	}
+
+	return false;
+}
+
+static int transaction_inode_pagecache_snapshot(struct _inode *shadow_inode,
+						struct address_space *mapping,
+						loff_t pos, size_t len)
+{
+	struct transaction_inode_pagecache_chunk *chunk;
+	struct folio *folio;
+	size_t offset;
+	void *src;
+
+	if (!len || transaction_inode_pagecache_covered(shadow_inode, pos, len))
+		return 0;
+
+	folio = filemap_get_folio(mapping, pos >> PAGE_SHIFT);
+	if (IS_ERR(folio))
+		return 0;
+
+	folio_lock(folio);
+	if (folio->mapping != mapping) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return 0;
+	}
+
+	chunk = kmalloc(struct_size(chunk, data, len), GFP_KERNEL);
+	if (!chunk) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return -ENOMEM;
+	}
+
+	chunk->pos = pos;
+	chunk->len = len;
+	offset = pos - folio_pos(folio);
+	src = kmap_local_folio(folio, offset);
+	memcpy(chunk->data, src, len);
+	kunmap_local(src);
+	list_add_tail(&chunk->list, &shadow_inode->tx_pagecache);
+
+	folio_unlock(folio);
+	folio_put(folio);
+	return 0;
+}
+
+static int transaction_inode_pagecache_snapshot_range(struct _inode *shadow_inode,
+						      struct inode *inode,
+						      loff_t start, loff_t end)
+{
+	struct address_space *mapping = inode->i_mapping;
+	loff_t pos = start;
+	int ret;
+
+	if (!mapping || start >= end)
+		return 0;
+
+	while (pos < end) {
+		size_t offset = pos & (PAGE_SIZE - 1);
+		size_t len = min_t(loff_t, end - pos, PAGE_SIZE - offset);
+
+		ret = transaction_inode_pagecache_snapshot(shadow_inode, mapping, pos, len);
+		if (ret)
+			return ret;
+		pos += len;
+	}
+
+	return 0;
+}
+
+static int transaction_inode_pagecache_restore(struct inode *inode,
+					       struct _inode *shadow_inode)
+{
+	struct transaction_inode_pagecache_chunk *chunk;
+	struct address_space *mapping = inode->i_mapping;
+	int ret = 0;
+
+	if (!mapping)
+		return 0;
+
+	list_for_each_entry(chunk, &shadow_inode->tx_pagecache, list) {
+		struct folio *folio;
+		size_t done = 0;
+
+		while (done < chunk->len) {
+			loff_t pos = chunk->pos + done;
+			size_t offset = pos & (PAGE_SIZE - 1);
+			size_t len = min_t(size_t, chunk->len - done, PAGE_SIZE - offset);
+			void *dst;
+
+			folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT,
+						    FGP_WRITEBEGIN, mapping_gfp_mask(mapping));
+			if (IS_ERR(folio)) {
+				ret = PTR_ERR(folio);
+				break;
+			}
+
+			if (!folio_test_uptodate(folio)) {
+				folio_zero_range(folio, 0, folio_size(folio));
+				folio_mark_uptodate(folio);
+			}
+
+			dst = kmap_local_folio(folio, offset);
+			memcpy(dst, chunk->data + done, len);
+			kunmap_local(dst);
+			flush_dcache_folio(folio);
+			folio_mark_dirty(folio);
+			folio_unlock(folio);
+			folio_put(folio);
+			done += len;
+		}
+
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 /* Initialize the generic transaction object embedded in struct inode. */
@@ -175,6 +338,8 @@ static void transaction_inode_copy_to_stable(struct inode *inode, struct _inode 
 		atomic_long_dec(&inode->i_sb->s_remove_count);
 	inode->__i_nlink = contents->i_nlink;
 	__i_size_write(inode, contents->i_size);
+	inode->i_blocks = contents->i_blocks;
+	inode->i_bytes = contents->i_bytes;
 	atomic64_set(&inode->i_version, atomic64_read(&contents->i_version));
 	inode->i_atime_sec = contents->i_atime_sec;
 	inode->i_mtime_sec = contents->i_mtime_sec;
@@ -203,6 +368,8 @@ static int transaction_inode_commit(struct txobj_thread_list_node *node) {
 	baseline = shadow_inode->shadow;
 	WARN_ON_ONCE(baseline != old);
 	transaction_inode_copy_to_stable(inode, shadow_inode);
+	transaction_inode_pagecache_free(shadow_inode);
+	transaction_inode_pagecache_init(shadow_inode);
 	shadow_inode->shadow = NULL;
 	rcu_assign_pointer(inode->i_contents, shadow_inode);
 	node->shadow_obj = NULL;
@@ -214,10 +381,12 @@ static int transaction_inode_commit(struct txobj_thread_list_node *node) {
 
 /* Abort discards the private version. */
 static int transaction_inode_abort(struct txobj_thread_list_node *node) {
-	if (node->rw == TRANSACTION_ACCESS_READ)
+	if (node->rw == TRANSACTION_ACCESS_READ) {
 		transaction_inode_contents_put(node->shadow_obj);
-	else
+	} else {
+		transaction_inode_pagecache_restore(node->orig_obj, node->shadow_obj);
 		transaction_inode_private_put(node->shadow_obj);
+	}
 	node->shadow_obj = NULL;
 	return 0;
 }
@@ -432,6 +601,25 @@ bool transaction_inode_set_size(struct inode *inode, loff_t size) {
 	return true;
 }
 EXPORT_SYMBOL_GPL(transaction_inode_set_size);
+
+int transaction_inode_snapshot_truncate(struct inode *inode, loff_t oldsize,
+					loff_t newsize)
+{
+	struct _inode *shadow_inode;
+
+	if (!inode || newsize >= oldsize)
+		return 0;
+
+	shadow_inode = transaction_inode_shadow(inode);
+	if (!shadow_inode)
+		return 0;
+	if (IS_ERR(shadow_inode))
+		return PTR_ERR(shadow_inode);
+
+	return transaction_inode_pagecache_snapshot_range(shadow_inode, inode,
+							  newsize, oldsize);
+}
+EXPORT_SYMBOL_GPL(transaction_inode_snapshot_truncate);
 
 bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
 				    const struct iattr *attr) {

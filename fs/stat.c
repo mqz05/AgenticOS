@@ -121,7 +121,7 @@ void generic_fillattr(struct mnt_idmap *idmap, u32 request_mask,
 			stat->ctime.tv_nsec = contents->i_ctime_nsec & ~I_CTIME_QUERIED;
 		}
 		stat->blksize = i_blocksize(inode);
-		stat->blocks = inode->i_blocks;
+		stat->blocks = contents->i_blocks;
 		goto version;
 	}
 #endif
@@ -962,6 +962,22 @@ COMPAT_SYSCALL_DEFINE2(newfstat, unsigned int, fd,
 /* Caller is here responsible for sufficient locking (ie. inode->i_lock) */
 void __inode_add_bytes(struct inode *inode, loff_t bytes)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			shadow_inode->i_blocks += bytes >> 9;
+			bytes &= 511;
+			shadow_inode->i_bytes += bytes;
+			if (shadow_inode->i_bytes >= 512) {
+				shadow_inode->i_blocks++;
+				shadow_inode->i_bytes -= 512;
+			}
+		}
+		return;
+	}
+#endif
 	inode->i_blocks += bytes >> 9;
 	bytes &= 511;
 	inode->i_bytes += bytes;
@@ -983,6 +999,22 @@ EXPORT_SYMBOL(inode_add_bytes);
 
 void __inode_sub_bytes(struct inode *inode, loff_t bytes)
 {
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			shadow_inode->i_blocks -= bytes >> 9;
+			bytes &= 511;
+			if (shadow_inode->i_bytes < bytes) {
+				shadow_inode->i_blocks--;
+				shadow_inode->i_bytes += 512;
+			}
+			shadow_inode->i_bytes -= bytes;
+		}
+		return;
+	}
+#endif
 	inode->i_blocks -= bytes >> 9;
 	bytes &= 511;
 	if (inode->i_bytes < bytes) {
@@ -1008,6 +1040,17 @@ loff_t inode_get_bytes(struct inode *inode)
 	loff_t ret;
 
 	spin_lock(&inode->i_lock);
+#ifdef CONFIG_TRANSACTIONS
+	{
+		struct _inode *contents = transaction_inode_visible(inode);
+
+		if (contents) {
+			ret = (((loff_t)contents->i_blocks) << 9) + contents->i_bytes;
+			spin_unlock(&inode->i_lock);
+			return ret;
+		}
+	}
+#endif
 	ret = __inode_get_bytes(inode);
 	spin_unlock(&inode->i_lock);
 	return ret;
@@ -1019,6 +1062,17 @@ void inode_set_bytes(struct inode *inode, loff_t bytes)
 {
 	/* Caller is here responsible for sufficient locking
 	 * (ie. inode->i_lock) */
+#ifdef CONFIG_TRANSACTIONS
+	struct _inode *shadow_inode = transaction_inode_shadow(inode);
+
+	if (shadow_inode) {
+		if (!IS_ERR(shadow_inode)) {
+			shadow_inode->i_blocks = bytes >> 9;
+			shadow_inode->i_bytes = bytes & 511;
+		}
+		return;
+	}
+#endif
 	inode->i_blocks = bytes >> 9;
 	inode->i_bytes = bytes & 511;
 }

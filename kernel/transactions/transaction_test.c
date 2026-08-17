@@ -1873,6 +1873,51 @@ static void transaction_inode_metadata_commit_test(struct kunit *test) {
 	fput(file);
 }
 
+static void transaction_inode_blocks_test(struct kunit *test) {
+	struct transaction *transaction;
+	struct inode *inode;
+	struct file *file;
+
+	file = anon_inode_create_getfile("[transaction-inode-blocks-test]",
+					 &transaction_test_file_operations,
+					 NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	inode = file_inode(file);
+	inode_set_bytes(inode, 522);
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	inode_add_bytes(inode, 600);
+	KUNIT_EXPECT_EQ(test, inode->i_blocks, 1);
+	KUNIT_EXPECT_EQ(test, inode->i_bytes, 10);
+	KUNIT_EXPECT_EQ(test, inode_get_bytes(inode), 1122LL);
+	KUNIT_EXPECT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, inode->i_blocks, 1);
+	KUNIT_EXPECT_EQ(test, inode->i_bytes, 10);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, current), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_inode_snapshot(inode), 0);
+	inode_add_bytes(inode, 600);
+	KUNIT_EXPECT_EQ(test, inode->i_blocks, 1);
+	KUNIT_EXPECT_EQ(test, inode->i_bytes, 10);
+	KUNIT_EXPECT_EQ(test, inode_get_bytes(inode), 1122LL);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, inode->i_blocks, 2);
+	KUNIT_EXPECT_EQ(test, inode->i_bytes, 98);
+	transaction_detach_task(current);
+	transaction_put(transaction);
+	fput(file);
+}
+
 static void transaction_inode_read_version_test(struct kunit *test) {
 	struct _inode *contents;
 	struct transaction *transaction;
@@ -2467,6 +2512,7 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_file_offset_commit_test),
 	KUNIT_CASE(transaction_inode_metadata_abort_test),
 	KUNIT_CASE(transaction_inode_metadata_commit_test),
+	KUNIT_CASE(transaction_inode_blocks_test),
 	KUNIT_CASE(transaction_inode_read_version_test),
 	KUNIT_CASE(transaction_inode_refresh_committed_test),
 	KUNIT_CASE(transaction_dentry_metadata_abort_test),

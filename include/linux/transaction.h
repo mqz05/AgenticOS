@@ -207,6 +207,7 @@ struct _inode *transaction_inode_shadow(struct inode *inode);
 bool transaction_inode_get_size(const struct inode *inode, loff_t *size);
 bool transaction_inode_set_size(struct inode *inode, loff_t size);
 bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode, const struct iattr *attr);
+int transaction_inode_snapshot_truncate(struct inode *inode, loff_t oldsize, loff_t newsize);
 int transaction_inode_read(struct inode *inode);
 int transaction_inode_snapshot(struct inode *inode);
 int transaction_inode_replace_committed_locked(struct transaction_object *object);
@@ -281,6 +282,10 @@ static inline bool transaction_inode_set_size(struct inode *inode, loff_t size) 
 static inline bool transaction_inode_setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
 						  						  const struct iattr *attr) {
 	return false;
+}
+static inline int transaction_inode_snapshot_truncate(struct inode *inode, loff_t oldsize,
+						      loff_t newsize) {
+	return 0;
 }
 static inline int transaction_inode_read(struct inode *inode) {
 	return 0;

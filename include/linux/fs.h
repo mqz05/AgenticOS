@@ -804,6 +804,8 @@ struct _inode {
 	unsigned int i_flags;
 	unsigned int i_nlink;
 	loff_t i_size;
+	blkcnt_t i_blocks;
+	unsigned short i_bytes;
 	atomic64_t i_version;
 	time64_t i_atime_sec;
 	time64_t i_mtime_sec;
@@ -811,6 +813,7 @@ struct _inode {
 	u32 i_atime_nsec;
 	u32 i_mtime_nsec;
 	u32 i_ctime_nsec;
+	struct list_head tx_pagecache;
 };
 #endif
 

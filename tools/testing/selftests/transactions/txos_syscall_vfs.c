@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -98,6 +99,24 @@ static int file_size_is(const char *path, off_t size)
 	return stat(path, &st) == 0 && st.st_size == size;
 }
 
+static int file_content_is(const char *path, const char *expected)
+{
+	char buf[64];
+	ssize_t len;
+	int fd;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	len = read(fd, buf, sizeof(buf));
+	if (close(fd) != 0 || len < 0)
+		return 0;
+
+	return (size_t)len == strlen(expected) &&
+	       memcmp(buf, expected, len) == 0;
+}
+
 int main(void)
 {
 	const char *path = "/tmp/txos-selftest-file";
@@ -105,7 +124,7 @@ int main(void)
 	int fd;
 
 	ksft_print_header();
-	ksft_set_plan(22);
+	ksft_set_plan(24);
 	cleanup_namespace_fixtures();
 
 	errno = 0;
@@ -170,6 +189,8 @@ int main(void)
 	}
 	ksft_test_result(file_size_is("/tmp/txos-truncate-abort", 6),
 			 "truncate size rollback through xabort\n");
+	ksft_test_result(file_content_is("/tmp/txos-truncate-abort", "abcdef"),
+			 "truncate page-cache rollback through xabort\n");
 
 	if (create_file_with_data("/tmp/txos-truncate-commit", "abcdef") != 0) {
 		ksft_test_result_fail("truncate size publish through xend\n");
@@ -219,6 +240,8 @@ int main(void)
 	close(fd);
 	ksft_test_result(file_size_is("/tmp/txos-ftruncate-abort", 6),
 			 "ftruncate size rollback through xabort\n");
+	ksft_test_result(file_content_is("/tmp/txos-ftruncate-abort", "abcdef"),
+			 "ftruncate page-cache rollback through xabort\n");
 
 	if (create_file_with_data("/tmp/txos-ftruncate-commit", "abcdef") != 0) {
 		ksft_test_result_fail("ftruncate size publish through xend\n");
