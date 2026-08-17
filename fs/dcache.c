@@ -3364,7 +3364,7 @@ EXPORT_SYMBOL(__d_lookup_unhash_wake);
 static inline int __d_add(struct dentry *dentry, struct inode *inode,
 				  const struct dentry_operations *ops)
 {
-	wait_queue_head_t *d_wait;
+	wait_queue_head_t *d_wait = NULL;
 	struct inode *dir = NULL;
 	unsigned n;
 	int ret;
@@ -3377,7 +3377,10 @@ static inline int __d_add(struct dentry *dentry, struct inode *inode,
 	}
 	if (unlikely(d_in_lookup(dentry))) {
 		dir = d_inode(dentry->d_parent);
-		n = start_dir_add(dir);
+		if (!dir)
+			dir = READ_ONCE(dentry->d_parent->d_inode);
+		if (dir)
+			n = start_dir_add(dir);
 		d_wait = __d_lookup_unhash(dentry);
 	}
 	if (unlikely(ops))
