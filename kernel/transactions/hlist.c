@@ -60,6 +60,15 @@ static void tx_hlist_state_init(struct tx_hlist_head_state *state, void *owner, 
 	atomic_set(&state->worksets, 0);
 }
 
+static struct transaction *tx_hlist_current_active_transaction(void)
+{
+	struct transaction *transaction = current_transaction();
+
+	if (transaction && transaction_status(transaction) != TRANSACTION_ACTIVE)
+		return NULL;
+	return transaction;
+}
+
 static bool tx_hlist_callbacks_equal(const struct tx_hlist_head_callbacks *first,
 				      const struct tx_hlist_head_callbacks *second) {
 	return first->owner == second->owner && first->get == second->get && first->put == second->put &&
@@ -210,7 +219,7 @@ int tx_hlist_bl_head_set_callbacks_lazy_locked(struct tx_hlist_bl_head *head,
 		return -EINVAL;
 	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
 		return -EINVAL;
-	state = tx_hlist_bl_state(head, current_transaction() != NULL);
+	state = tx_hlist_bl_state(head, tx_hlist_current_active_transaction() != NULL);
 	if (!state)
 		return 0;
 	if (IS_ERR(state))
@@ -566,7 +575,7 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 			    bool can_sleep, struct transaction **waiter,
 			    struct tx_hlist_workset **result) {
 	struct txobj_thread_list_node *node;
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_workset *workset;
 	struct transaction *winner;
 	enum transaction_access_mode tx_access = TRANSACTION_ACCESS_READ;
@@ -592,9 +601,6 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 		spin_unlock(&state->transaction_object.lock);
 		return ret;
 	}
-	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
-		return live_transaction(transaction) || aborting_transaction(transaction) ? -ECANCELED : -EBUSY;
-
 	if (access == TRANSACTION_ACCESS_READ) {
 		next_mode = TX_HLIST_R;
 		if (state->mode == TX_HLIST_W || state->mode == TX_HLIST_EXCL) {
@@ -680,7 +686,7 @@ free_node:
 }
 
 static int tx_hlist_contend_ref(struct tx_hlist_ref_state *cursor) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	int ret;
 
 	if (!cursor->transaction || cursor->transaction == transaction)
@@ -721,7 +727,7 @@ int tx_hlist_prepare(struct tx_hlist_entry_ref *ref, struct tx_hlist_head *head,
 	struct transaction *waiter;
 	int ret;
 
-	if (current_transaction())
+	if (tx_hlist_current_active_transaction())
 		return 0;
 retry:
 	waiter = NULL;
@@ -748,7 +754,7 @@ int tx_hlist_bl_prepare(struct tx_hlist_bl_entry_ref *ref, struct tx_hlist_bl_he
 	struct transaction *waiter;
 	int ret;
 
-	if (current_transaction())
+	if (tx_hlist_current_active_transaction())
 		return 0;
 retry:
 	waiter = NULL;
@@ -798,7 +804,7 @@ static struct tx_hlist_spec_entry *tx_hlist_publish_spec(struct tx_hlist_spec_en
 static int tx_hlist_add_locked_common(struct tx_hlist_ref_state *cursor,
 				      struct tx_hlist_head_state *parent, bool can_sleep,
 				      struct transaction **waiter) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_workset *workset;
 	struct tx_hlist_spec_entry *entry;
 	int ret;
@@ -844,7 +850,7 @@ out:
 }
 
 static struct tx_hlist_head_state *tx_hlist_logical_parent_locked(struct tx_hlist_ref_state *cursor) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 
 	if (transaction && cursor->transaction == transaction && cursor->sentry &&
 	    cursor->sentry->state == TX_HLIST_TRANSACTIONAL_ADD)
@@ -927,7 +933,7 @@ static int tx_hlist_move_common(struct tx_hlist_ref_state *cursor, struct tx_hli
 				bool protocol_held) {
 	struct tx_hlist_spec_entry *first_entry = NULL;
 	struct tx_hlist_spec_entry *second_entry = NULL;
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_workset *source_workset = NULL;
 	struct tx_hlist_workset *destination_workset;
 	struct tx_hlist_head_state *source;
@@ -1067,7 +1073,7 @@ free_entries:
 static int tx_hlist_del_locked_common(struct tx_hlist_ref_state *cursor, bool can_sleep,
 				      struct transaction **waiter) {
 	struct tx_hlist_head_state *parent = tx_hlist_logical_parent(cursor);
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_workset *workset;
 	struct tx_hlist_spec_entry *entry;
 	int ret;
@@ -1187,7 +1193,7 @@ bool tx_hlist_unreferenced(struct tx_hlist_entry_ref *ref) {
 EXPORT_SYMBOL_GPL(tx_hlist_unreferenced);
 
 bool tx_hlist_visible_unhashed(struct tx_hlist_entry_ref *ref) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	bool unhashed;
 
 	if (!transaction)
@@ -1217,7 +1223,7 @@ int tx_hlist_bl_add_head_lazy_locked(struct tx_hlist_bl_entry_ref *ref, struct t
 
 	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
 		return -EINVAL;
-	state = tx_hlist_bl_state(head, current_transaction() != NULL);
+	state = tx_hlist_bl_state(head, tx_hlist_current_active_transaction() != NULL);
 	if (IS_ERR(state))
 		return PTR_ERR(state);
 	if (state)
@@ -1275,7 +1281,7 @@ int tx_hlist_bl_del_head_locked(struct tx_hlist_bl_entry_ref *ref, struct tx_hli
 
 	if (WARN_ON_ONCE(!hlist_bl_is_locked(&head->head)))
 		return -EINVAL;
-	state = tx_hlist_bl_state(head, current_transaction() != NULL);
+	state = tx_hlist_bl_state(head, tx_hlist_current_active_transaction() != NULL);
 	if (IS_ERR(state))
 		return PTR_ERR(state);
 	if (!state) {
@@ -1338,7 +1344,8 @@ int tx_hlist_bl_move_under_protocol(struct tx_hlist_bl_entry_ref *ref, struct tx
 	state = tx_hlist_bl_state(head, true);
 	if (IS_ERR(state))
 		return PTR_ERR(state);
-	return tx_hlist_move_common(&ref->state, state, !current_transaction());
+	return tx_hlist_move_common(&ref->state, state,
+				    !tx_hlist_current_active_transaction());
 }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_move_under_protocol);
 
@@ -1348,7 +1355,7 @@ bool tx_hlist_bl_unreferenced(struct tx_hlist_bl_entry_ref *ref) {
 EXPORT_SYMBOL_GPL(tx_hlist_bl_unreferenced);
 
 bool tx_hlist_bl_visible_unhashed(struct tx_hlist_bl_entry_ref *ref) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	bool unhashed;
 
 	if (!transaction)
@@ -1414,7 +1421,7 @@ void tx_hlist_put_iterator_locked(struct tx_hlist_iterator *iter) { }
 EXPORT_SYMBOL_GPL(tx_hlist_put_iterator_locked);
 
 bool tx_hlist_iter_next(struct tx_hlist_iterator *iter) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_spec_entry *entry;
 	struct tx_hlist_entry_ref *ref;
 
@@ -1457,8 +1464,8 @@ struct tx_hlist_entry_ref *tx_hlist_first_locked(struct tx_hlist_head *head) {
 
 	ret = tx_hlist_get_iterator_locked(&iter, head);
 	if (ret) {
-		if (current_transaction())
-			abort_transaction(current_transaction());
+		if (tx_hlist_current_active_transaction())
+			abort_transaction(tx_hlist_current_active_transaction());
 		return NULL;
 	}
 	if (tx_hlist_iter_next(&iter))
@@ -1478,8 +1485,8 @@ struct tx_hlist_entry_ref *tx_hlist_next_locked(struct tx_hlist_entry_ref *ref) 
 		return NULL;
 	ret = tx_hlist_get_iterator_locked(&iter, parent->owner);
 	if (ret) {
-		if (current_transaction())
-			abort_transaction(current_transaction());
+		if (tx_hlist_current_active_transaction())
+			abort_transaction(tx_hlist_current_active_transaction());
 		return NULL;
 	}
 	while (tx_hlist_iter_next(&iter)) {
@@ -1572,7 +1579,7 @@ void tx_hlist_bl_put_iterator_locked(struct tx_hlist_bl_iterator *iter) { }
 EXPORT_SYMBOL_GPL(tx_hlist_bl_put_iterator_locked);
 
 bool tx_hlist_bl_iter_next(struct tx_hlist_bl_iterator *iter) {
-	struct transaction *transaction = current_transaction();
+	struct transaction *transaction = tx_hlist_current_active_transaction();
 	struct tx_hlist_spec_entry *entry;
 	struct tx_hlist_bl_entry_ref *ref;
 

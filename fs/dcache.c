@@ -185,6 +185,13 @@ static void d_alias_init(struct dentry *dentry) {
 					     d_alias_publish_end);
 }
 
+static bool dcache_current_transaction_active(void)
+{
+	struct transaction *transaction = current_transaction();
+
+	return transaction && transaction_status(transaction) == TRANSACTION_ACTIVE;
+}
+
 static int d_hash_prepare(struct dentry *dentry, struct hlist_bl_head *head) {
 	return tx_hlist_bl_prepare(dentry ? &dentry->d_hash_tx : NULL, d_hash_tx_head(head),
 				   TRANSACTION_ACCESS_READ_WRITE);
@@ -205,7 +212,7 @@ static int dentry_relations_prepare(struct dentry *dentry) {
 	struct inode *inode;
 	int ret;
 
-	if (current_transaction())
+	if (dcache_current_transaction_active())
 		return 0;
 	if (!hlist_bl_unhashed(&dentry->d_hash)) {
 		ret = d_hash_prepare(dentry, d_hash(dentry->d_name.hash));
@@ -273,6 +280,11 @@ static void d_children_put(void *owner) {
 	dput(owner);
 }
 #else
+static bool dcache_current_transaction_active(void)
+{
+	return false;
+}
+
 static int d_hash_add_locked(struct dentry *dentry, struct hlist_bl_head *head) {
 	hlist_bl_add_head_rcu(&dentry->d_hash, head);
 	return 0;
@@ -689,7 +701,8 @@ static inline int __d_set_inode_and_type(struct dentry *dentry, struct inode *in
 					 unsigned int type_flags)
 {
 #ifdef CONFIG_TRANSACTIONS
-	struct _dentry *shadow = transaction_dentry_shadow(dentry);
+	struct _dentry *shadow = dcache_current_transaction_active() ?
+				 transaction_dentry_shadow(dentry) : NULL;
 #endif
 	unsigned flags;
 
@@ -717,7 +730,8 @@ static inline int __d_set_inode_and_type(struct dentry *dentry, struct inode *in
 static inline int __d_clear_type_and_inode(struct dentry *dentry)
 {
 #ifdef CONFIG_TRANSACTIONS
-	struct _dentry *shadow = transaction_dentry_shadow(dentry);
+	struct _dentry *shadow = dcache_current_transaction_active() ?
+				 transaction_dentry_shadow(dentry) : NULL;
 #endif
 	unsigned flags = READ_ONCE(dentry->d_flags);
 
@@ -798,7 +812,7 @@ static void dentry_unlink_inode(struct dentry * dentry)
 	__releases(dentry->d_inode->i_lock)
 {
 	struct inode *inode = d_inode(dentry);
-	bool transactional = current_transaction() != NULL;
+	bool transactional = dcache_current_transaction_active();
 
 	raw_write_seqcount_begin(&dentry->d_seq);
 	if (__d_clear_type_and_inode(dentry)) {
@@ -931,7 +945,7 @@ static void ___d_drop(struct dentry *dentry)
 static void __d_drop_no_tx_snapshot(struct dentry *dentry) {
 	if (!d_unhashed(dentry)) {
 		___d_drop(dentry);
-		if (!current_transaction()) {
+		if (!dcache_current_transaction_active()) {
 			dentry->d_hash.pprev = NULL;
 			write_seqcount_invalidate(&dentry->d_seq);
 		}
@@ -940,7 +954,8 @@ static void __d_drop_no_tx_snapshot(struct dentry *dentry) {
 
 void __d_drop(struct dentry *dentry)
 {
-	if (transaction_dentry_snapshot_locked(dentry))
+	if (dcache_current_transaction_active() &&
+	    transaction_dentry_snapshot_locked(dentry))
 		return;
 	__d_drop_no_tx_snapshot(dentry);
 }
@@ -988,7 +1003,7 @@ static inline void dentry_unlist(struct dentry *dentry)
 		return;
 	if (dcache_transaction_error(d_child_del_locked(dentry)))
 		return;
-	if (current_transaction())
+	if (dcache_current_transaction_active())
 		return;
 	/*
 	 * Cursors can move around the list of children.  While we'd been
