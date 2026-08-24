@@ -22,6 +22,7 @@ struct transaction_dentry_private {
 	struct inode *commit_iput;
 	struct inode *abort_iput;
 	struct list_head deferred_iputs;
+	unsigned int deferred_dputs;
 	bool published;
 };
 
@@ -33,6 +34,7 @@ static void transaction_dentry_private_init(struct transaction_dentry_private *p
 	private->commit_iput = NULL;
 	private->abort_iput = NULL;
 	INIT_LIST_HEAD(&private->deferred_iputs);
+	private->deferred_dputs = 0;
 	private->published = false;
 }
 
@@ -280,6 +282,12 @@ static int transaction_dentry_release(struct txobj_thread_list_node *node, int e
 			list_del(&deferred->list);
 			iput(deferred->inode);
 			kfree(deferred);
+		}
+		if (published) {
+			while (private->deferred_dputs) {
+				private->deferred_dputs--;
+				dput(dentry);
+			}
 		}
 	}
 	if (node->rw == TRANSACTION_ACCESS_READ_WRITE && shadow && !published)
@@ -637,3 +645,16 @@ int transaction_dentry_snapshot_unlink(struct dentry *dentry) {
 	return IS_ERR(shadow) ? PTR_ERR(shadow) : 0;
 }
 EXPORT_SYMBOL_GPL(transaction_dentry_snapshot_unlink);
+
+bool transaction_dentry_defer_dput(struct dentry *dentry)
+{
+	struct _dentry *shadow = transaction_dentry_shadow(dentry);
+	struct transaction_dentry_private *private;
+
+	if (!shadow || IS_ERR(shadow))
+		return false;
+	private = transaction_dentry_private(shadow);
+	private->deferred_dputs++;
+	return true;
+}
+EXPORT_SYMBOL_GPL(transaction_dentry_defer_dput);

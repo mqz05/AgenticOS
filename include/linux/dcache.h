@@ -640,7 +640,7 @@ static inline struct inode *d_inode_rcu(const struct dentry *dentry)
  */
 static inline struct inode *d_backing_inode(const struct dentry *upper)
 {
-	struct inode *inode = upper->d_inode;
+	struct inode *inode = d_inode(upper);
 
 	return inode;
 }

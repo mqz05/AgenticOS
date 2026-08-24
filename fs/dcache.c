@@ -3224,6 +3224,7 @@ struct dentry *d_alloc_parallel(struct dentry *parent,
 				const struct qstr *name,
 				wait_queue_head_t *wq)
 {
+	struct inode *dir = d_inode(parent);
 	unsigned int hash = name->hash;
 	struct hlist_bl_head *b = in_lookup_hash(parent, hash);
 	struct hlist_bl_node *node;
@@ -3255,13 +3256,13 @@ struct dentry *d_alloc_parallel(struct dentry *parent,
 		dput(new);
 		return ERR_PTR(-ECANCELED);
 	}
-	if (parent->d_flags & DCACHE_DISCONNECTED)
+	if (dentry_get_flags(parent) & DCACHE_DISCONNECTED)
 		new->d_flags |= DCACHE_DISCONNECTED;
 	spin_unlock(&parent->d_lock);
 
 retry:
 	rcu_read_lock();
-	seq = smp_load_acquire(&parent->d_inode->i_dir_seq);
+	seq = smp_load_acquire(&dir->i_dir_seq);
 	r_seq = read_seqbegin(&rename_lock);
 	dentry = __d_lookup_rcu(parent, name, &d_seq);
 	if (unlikely(dentry)) {
@@ -3289,7 +3290,7 @@ retry:
 	}
 
 	hlist_bl_lock(b);
-	if (unlikely(READ_ONCE(parent->d_inode->i_dir_seq) != seq)) {
+	if (unlikely(READ_ONCE(dir->i_dir_seq) != seq)) {
 		hlist_bl_unlock(b);
 		rcu_read_unlock();
 		goto retry;

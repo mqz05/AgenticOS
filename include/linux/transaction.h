@@ -225,6 +225,7 @@ bool transaction_dentry_set_flags(struct dentry *dentry, unsigned int flags, uns
 int transaction_dentry_snapshot(struct dentry *dentry);
 int transaction_dentry_snapshot_locked(struct dentry *dentry);
 int transaction_dentry_snapshot_unlink(struct dentry *dentry);
+bool transaction_dentry_defer_dput(struct dentry *dentry);
 int transaction_dentry_record_inode_change(struct dentry *dentry, struct inode *old_inode, struct inode *new_inode);
 void transaction_dentry_publish_inode(struct dentry *dentry, struct inode *old_inode, struct inode *new_inode);
 void transaction_dentry_put_committed_inode(struct dentry *dentry, struct inode *inode);
@@ -316,6 +317,10 @@ static inline int transaction_dentry_snapshot_locked(struct dentry *dentry) {
 }
 static inline int transaction_dentry_snapshot_unlink(struct dentry *dentry) {
 	return 0;
+}
+
+static inline bool transaction_dentry_defer_dput(struct dentry *dentry) {
+	return false;
 }
 #endif
 

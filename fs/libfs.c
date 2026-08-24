@@ -887,7 +887,8 @@ int simple_unlink(struct inode *dir, struct dentry *dentry)
 	inode_set_mtime_to_ts(dir,
 			      inode_set_ctime_to_ts(dir, inode_set_ctime_current(inode)));
 	drop_nlink(inode);
-	dput(dentry);
+	if (!transaction_dentry_defer_dput(dentry))
+		dput(dentry);
 	return 0;
 }
 EXPORT_SYMBOL(simple_unlink);

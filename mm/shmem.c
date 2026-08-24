@@ -4012,7 +4012,15 @@ static int shmem_unlink(struct inode *dir, struct dentry *dentry)
 			      inode_set_ctime_to_ts(dir, inode_set_ctime_current(inode)));
 	inode_inc_iversion(dir);
 	drop_nlink(inode);
-	dput(dentry);	/* Undo the count from "create" - does all the work */
+	/*
+	 * Creation gives shmem dentries a persistent pin.  Dropping that pin is
+	 * part of unlink publication: doing it before a system transaction has
+	 * committed can destroy the only positive namespace entry and makes an
+	 * abort impossible to observe.  The dentry adapter releases it on commit
+	 * and discards the deferred operation on abort.
+	 */
+	if (!transaction_dentry_defer_dput(dentry))
+		dput(dentry);	/* Undo the count from "create" - does all the work */
 
 	/*
 	 * For now, VFS can't deal with case-insensitive negative dentries, so

@@ -562,13 +562,27 @@ EXPORT_SYMBOL_GPL(transaction_inode_visible);
 struct _inode *transaction_inode_shadow(struct inode *inode) {
 	struct txobj_thread_list_node *node = transaction_inode_workset_node(inode);
 	struct transaction *transaction = current_transaction();
+	struct _inode *shadow_inode;
 
 	if (!node)
 		return NULL;
-	if (node->rw != TRANSACTION_ACCESS_READ_WRITE ||
-	    transaction_status(transaction) != TRANSACTION_ACTIVE) {
+	if (transaction_status(transaction) != TRANSACTION_ACTIVE) {
 		abort_transaction(transaction);
 		return ERR_PTR(-ECANCELED);
+	}
+	/*
+	 * A metadata reader may become a writer later in the same syscall.  This
+	 * is common for symlink creation: security hooks first observe the parent
+	 * inode and tmpfs subsequently updates its size and timestamps.  Upgrade
+	 * through the normal acquisition path so the committed read version is
+	 * never modified in place.
+	 */
+	if (node->rw != TRANSACTION_ACCESS_READ_WRITE) {
+		shadow_inode = transaction_inode_get(inode,
+						     TRANSACTION_ACCESS_READ_WRITE);
+		if (IS_ERR(shadow_inode))
+			abort_transaction(transaction);
+		return shadow_inode;
 	}
 	return node->shadow_obj;
 }
