@@ -65,6 +65,7 @@ int transaction_checkpoint_capture(struct task_struct *task, struct pt_regs *reg
 	checkpoint->regs_checkpoint = *regs;
 	WRITE_ONCE(checkpoint->mm, mm);
 	WRITE_ONCE(checkpoint->need_autoretry, false);
+	WRITE_ONCE(checkpoint->mm_prepared, false);
 	WRITE_ONCE(checkpoint->valid, true);
 	return 0;
 }
@@ -149,6 +150,7 @@ static void transaction_checkpoint_discard_state(struct transaction_checkpoint *
 	WRITE_ONCE(checkpoint->valid, false);
 	WRITE_ONCE(checkpoint->need_autoretry, false);
 	transaction_checkpoint_clear_undo_state(checkpoint);
+	transaction_checkpoint_unprotect_mm(checkpoint);
 	mm = xchg(&checkpoint->mm, NULL);
 	if (mm)
 		mmput(mm);

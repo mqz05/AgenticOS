@@ -4,6 +4,7 @@
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/transaction.h>
 #include <linux/transaction_checkpoint.h>
 
@@ -48,6 +49,7 @@ static void transaction_checkpoint_attach_lifecycle_test(struct kunit *test) {
 	KUNIT_ASSERT_NOT_NULL(test, checkpoint);
 	KUNIT_EXPECT_FALSE(test, checkpoint->valid);
 	KUNIT_EXPECT_FALSE(test, checkpoint->need_autoretry);
+	KUNIT_EXPECT_FALSE(test, checkpoint->mm_prepared);
 	KUNIT_EXPECT_PTR_EQ(test, checkpoint->mm, NULL);
 	KUNIT_EXPECT_TRUE(test, list_empty(&checkpoint->undo_log));
 
@@ -199,6 +201,44 @@ static void transaction_checkpoint_undo_log_test(struct kunit *test) {
 	transaction_put(transaction);
 }
 
+static void transaction_checkpoint_prepare_mm_test(struct kunit *test) {
+	struct transaction_checkpoint *checkpoint;
+	struct transaction *transaction;
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct pt_regs regs = { };
+
+	task = transaction_checkpoint_test_task(test);
+	KUNIT_ASSERT_NOT_NULL(test, task);
+	mm = mm_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, mm);
+	task->mm = mm;
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, task), 0);
+	regs.cs = __USER_CS;
+	KUNIT_ASSERT_EQ(test, transaction_checkpoint_capture(task, &regs), 0);
+	checkpoint = READ_ONCE(task->transaction_checkpoint);
+	KUNIT_ASSERT_NOT_NULL(test, checkpoint);
+
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(checkpoint->mm_prepared));
+	mmget(mm);
+	KUNIT_EXPECT_EQ(test, transaction_checkpoint_prepare_mm(task), -EOPNOTSUPP);
+	mmput(mm);
+	KUNIT_ASSERT_EQ(test, transaction_checkpoint_prepare_mm(task), 0);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(checkpoint->mm_prepared));
+	KUNIT_EXPECT_EQ(test, transaction_checkpoint_prepare_mm(task), -EALREADY);
+	transaction_checkpoint_discard(task);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(checkpoint->mm_prepared));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(checkpoint->valid));
+	KUNIT_EXPECT_PTR_EQ(test, READ_ONCE(checkpoint->mm), NULL);
+
+	transaction_detach_task(task);
+	task->mm = NULL;
+	mmput(mm);
+	transaction_put(transaction);
+}
+
 static void transaction_checkpoint_rejected_attach_cleanup_test(struct kunit *test) {
 	struct transaction *transaction;
 	struct task_struct *first_task;
@@ -241,6 +281,7 @@ static struct kunit_case transaction_checkpoint_test_cases[] = {
 	KUNIT_CASE(transaction_checkpoint_capture_test),
 	KUNIT_CASE(transaction_checkpoint_free_discards_capture_test),
 	KUNIT_CASE(transaction_checkpoint_undo_log_test),
+	KUNIT_CASE(transaction_checkpoint_prepare_mm_test),
 	KUNIT_CASE(transaction_checkpoint_rejected_attach_cleanup_test),
 	KUNIT_CASE(transaction_checkpoint_task_exit_cleanup_test),
 	{ }

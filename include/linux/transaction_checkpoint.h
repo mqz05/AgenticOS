@@ -26,6 +26,7 @@ struct transaction_checkpoint {
 	struct mm_struct *mm;
 	bool valid;
 	bool need_autoretry;
+	bool mm_prepared;
 };
 
 int transaction_checkpoint_alloc(struct task_struct *task);
@@ -34,6 +35,8 @@ int transaction_checkpoint_capture(struct task_struct *task, struct pt_regs *reg
 int transaction_checkpoint_log_page(struct task_struct *task, struct page *stable,
 				    struct page *checkpoint, unsigned long addr);
 void transaction_checkpoint_clear_undo(struct task_struct *task);
+int transaction_checkpoint_prepare_mm(struct task_struct *task);
+void transaction_checkpoint_unprotect_mm(struct transaction_checkpoint *checkpoint);
 void transaction_checkpoint_discard(struct task_struct *task);
 void transaction_checkpoint_free(struct task_struct *task);
 
