@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <kunit/test.h>
+#include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/transaction.h>
@@ -17,6 +18,10 @@ static struct task_struct *transaction_checkpoint_test_task(struct kunit *test) 
 	transaction_task_init(task);
 	spin_lock_init(&task->alloc_lock);
 	return task;
+}
+
+static void transaction_checkpoint_test_put_page(void *data) {
+	put_page(data);
 }
 
 static void transaction_checkpoint_task_init_test(struct kunit *test) {
@@ -97,6 +102,8 @@ static void transaction_checkpoint_capture_test(struct kunit *test) {
 static void transaction_checkpoint_free_discards_capture_test(struct kunit *test) {
 	struct transaction *transaction;
 	struct task_struct *task;
+	struct page *page_checkpoint;
+	struct page *stable;
 	struct mm_struct *mm;
 	struct pt_regs regs = { };
 
@@ -113,9 +120,82 @@ static void transaction_checkpoint_free_discards_capture_test(struct kunit *test
 	regs.cs = __USER_CS;
 	KUNIT_ASSERT_EQ(test, transaction_checkpoint_capture(task, &regs), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&mm->mm_users), 2);
+	stable = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, stable);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, transaction_checkpoint_test_put_page,
+							stable), 0);
+	page_checkpoint = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, page_checkpoint);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, transaction_checkpoint_test_put_page,
+							page_checkpoint), 0);
+	KUNIT_ASSERT_EQ(test, transaction_checkpoint_log_page(task, stable, page_checkpoint, 0), 0);
+	KUNIT_EXPECT_EQ(test, page_count(stable), 2);
+	KUNIT_EXPECT_EQ(test, page_count(page_checkpoint), 2);
 	transaction_detach_task(task);
 	KUNIT_EXPECT_PTR_EQ(test, READ_ONCE(task->transaction_checkpoint), NULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&mm->mm_users), 1);
+	KUNIT_EXPECT_EQ(test, page_count(stable), 1);
+	KUNIT_EXPECT_EQ(test, page_count(page_checkpoint), 1);
+	transaction_put(transaction);
+}
+
+static void transaction_checkpoint_undo_log_test(struct kunit *test) {
+	struct transaction_checkpoint *checkpoint;
+	struct transaction *transaction;
+	struct undo_log_rec *undo;
+	struct task_struct *task;
+	struct page *page_checkpoint;
+	struct page *stable;
+	struct mm_struct *mm;
+	struct pt_regs regs = { };
+	int ret;
+
+	task = transaction_checkpoint_test_task(test);
+	KUNIT_ASSERT_NOT_NULL(test, task);
+	mm = kunit_kzalloc(test, sizeof(*mm), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, mm);
+	atomic_set(&mm->mm_users, 1);
+	task->mm = mm;
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, transaction_attach_task(transaction, task), 0);
+	regs.cs = __USER_CS;
+	KUNIT_ASSERT_EQ(test, transaction_checkpoint_capture(task, &regs), 0);
+
+	stable = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, stable);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, transaction_checkpoint_test_put_page,
+							stable), 0);
+	page_checkpoint = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, page_checkpoint);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, transaction_checkpoint_test_put_page,
+							page_checkpoint), 0);
+
+	ret = transaction_checkpoint_log_page(task, stable, stable, 0);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	ret = transaction_checkpoint_log_page(task, stable, page_checkpoint, 1);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	ret = transaction_checkpoint_log_page(task, stable, page_checkpoint, PAGE_SIZE);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	checkpoint = READ_ONCE(task->transaction_checkpoint);
+	KUNIT_ASSERT_NOT_NULL(test, checkpoint);
+	KUNIT_ASSERT_FALSE(test, list_empty(&checkpoint->undo_log));
+	undo = list_first_entry(&checkpoint->undo_log, struct undo_log_rec, list);
+	KUNIT_EXPECT_PTR_EQ(test, undo->stable, stable);
+	KUNIT_EXPECT_PTR_EQ(test, undo->checkpoint, page_checkpoint);
+	KUNIT_EXPECT_EQ(test, undo->addr, PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, page_count(stable), 2);
+	KUNIT_EXPECT_EQ(test, page_count(page_checkpoint), 2);
+	ret = transaction_checkpoint_log_page(task, stable, page_checkpoint, PAGE_SIZE);
+	KUNIT_EXPECT_EQ(test, ret, -EEXIST);
+	KUNIT_EXPECT_EQ(test, page_count(stable), 2);
+	KUNIT_EXPECT_EQ(test, page_count(page_checkpoint), 2);
+
+	transaction_checkpoint_clear_undo(task);
+	KUNIT_EXPECT_TRUE(test, list_empty(&checkpoint->undo_log));
+	KUNIT_EXPECT_EQ(test, page_count(stable), 1);
+	KUNIT_EXPECT_EQ(test, page_count(page_checkpoint), 1);
+	transaction_detach_task(task);
 	transaction_put(transaction);
 }
 
@@ -160,6 +240,7 @@ static struct kunit_case transaction_checkpoint_test_cases[] = {
 	KUNIT_CASE(transaction_checkpoint_attach_lifecycle_test),
 	KUNIT_CASE(transaction_checkpoint_capture_test),
 	KUNIT_CASE(transaction_checkpoint_free_discards_capture_test),
+	KUNIT_CASE(transaction_checkpoint_undo_log_test),
 	KUNIT_CASE(transaction_checkpoint_rejected_attach_cleanup_test),
 	KUNIT_CASE(transaction_checkpoint_task_exit_cleanup_test),
 	{ }
