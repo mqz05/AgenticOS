@@ -20,6 +20,8 @@ struct transaction_checkpoint {
 };
 
 int transaction_checkpoint_alloc(struct task_struct *task);
+int transaction_checkpoint_capture(struct task_struct *task, struct pt_regs *regs);
+void transaction_checkpoint_discard(struct task_struct *task);
 void transaction_checkpoint_free(struct task_struct *task);
 
 #endif /* _LINUX_TRANSACTION_CHECKPOINT_H */

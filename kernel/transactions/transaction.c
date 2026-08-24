@@ -5,6 +5,7 @@
 #include <linux/bug.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/sched/prio.h>
 #include <linux/slab.h>
@@ -904,7 +905,19 @@ EXPORT_SYMBOL_GPL(transaction_sys_xabort);
 
 // Syscall wrapper for xbegin()
 SYSCALL_DEFINE0(xbegin) {
-	return transaction_sys_xbegin();
+	long cleanup_ret;
+	long ret;
+
+	ret = transaction_sys_xbegin();
+	if (ret)
+		return ret;
+
+	ret = transaction_checkpoint_capture(current, current_pt_regs());
+	if (!ret)
+		return 0;
+
+	cleanup_ret = transaction_sys_xabort();
+	return cleanup_ret ? cleanup_ret : ret;
 }
 
 // Syscall wrapper for xend()
