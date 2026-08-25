@@ -100,6 +100,7 @@ static int tx_list2_commit(struct txobj_thread_list_node * node) {
 	struct tx_list2_head *head = node->orig_obj;
 	struct tx_list2_entry *entry;
 	struct tx_list2_entry *next;
+	bool changed = false;
 
 restart:
 	list_for_each_entry_safe(entry, next, &head->spec_list, spec) {
@@ -107,6 +108,7 @@ restart:
 			continue;
 
 		if (entry->transactional_state == TX_LIST2_TRANSACTIONAL_ADD) {
+			changed = true;
 			struct tx_list2_entry *stable = &entry->cursor->entry;
 			bool moved_deleted_stable = false;
 
@@ -130,6 +132,7 @@ restart:
 			if (moved_deleted_stable)
 				goto restart;
 		} else if (entry->transactional_state == TX_LIST2_TRANSACTIONAL_DEL) {
+			changed = true;
 			list_del_init(&entry->list);
 			entry->transactional_state = TX_LIST2_NON_TX;
 			entry->transaction = NULL;
@@ -146,6 +149,8 @@ restart:
 		}
 	}
 
+	if (changed)
+		node->tx_obj->version++;
 	tx_list2_finish_mode(node);
 	return 0;
 }
@@ -189,11 +194,25 @@ static int tx_list2_abort(struct txobj_thread_list_node * node) {
 	return 0;
 }
 
+static int tx_list2_validate(struct txobj_thread_list_node *node)
+{
+	struct tx_list2_head *head = node->orig_obj;
+	int ret = transaction_object_validate(node);
+
+	if (ret)
+		return ret;
+	if (head->mode == TX_LIST2_NO_TX)
+		return -ESTALE;
+	return 0;
+}
+
 /* Add this list head to the current transaction's list workset.
    This mirrors TxOS list_list behavior: list heads are tracked separately
    from ordinary transaction objects but still use transaction_object_acquire()
    for ownership and conflict handling. */
-static int tx_list2_acquire(struct tx_list2_head * head, enum transaction_access_mode list_access) {
+static int tx_list2_acquire(struct tx_list2_head *head,
+			    enum transaction_access_mode list_access,
+			    struct transaction **waiter) {
 	struct txobj_thread_list_node *node;
 	struct transaction *transaction;
 	enum transaction_access_mode tx_access = TRANSACTION_ACCESS_READ;
@@ -201,8 +220,14 @@ static int tx_list2_acquire(struct tx_list2_head * head, enum transaction_access
 	int ret;
 
 	transaction = current_transaction();
-	if (!transaction)
-		return 0;
+	if (waiter)
+		*waiter = NULL;
+	if (!transaction) {
+		if (waiter)
+			*waiter = transaction_object_conflict_get(&head->transaction_object,
+								  list_access);
+		return waiter && *waiter ? -EAGAIN : 0;
+	}
 	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
 		return live_transaction(transaction) ? -ECANCELED : 0;
 
@@ -238,6 +263,7 @@ static int tx_list2_acquire(struct tx_list2_head * head, enum transaction_access
 
 	node->lock = tx_list2_lock;
 	node->unlock = tx_list2_unlock;
+	node->validate = tx_list2_validate;
 	node->commit = tx_list2_commit;
 	node->abort = tx_list2_abort;
 	node->nonblocking_lock_id = &head->lock;
@@ -265,11 +291,12 @@ free_node:
 /* Acquire write access to a list entry reference.
    If another transaction owns the same entry ref, use the transaction
    contention manager to decide which transaction must abort. */
-static int tx_list2_acquire_entry_ref(struct tx_list2_head * head, struct tx_list2_entry_ref * ref) {
+static int tx_list2_acquire_entry_ref(struct tx_list2_head *head,
+				      struct tx_list2_entry_ref *ref) {
 	struct transaction *transaction = current_transaction();
 	int ret;
 
-	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE);
+	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE, NULL);
 	if (ret || !transaction)
 		return ret;
 
@@ -292,7 +319,9 @@ static int tx_list2_acquire_entry_ref(struct tx_list2_head * head, struct tx_lis
 /* Add an entry while the caller holds head->lock.
    Inside a transaction, allocate a speculative entry and add it to both the 
    visible list and spec_list. Outside a transaction, add the stable entry directly. */
-static int tx_list2_add_locked(struct tx_list2_entry_ref * cursor, struct tx_list2_head * head, bool tail) {
+static int tx_list2_add_locked(struct tx_list2_entry_ref *cursor,
+			       struct tx_list2_head *head, bool tail,
+			       struct transaction **waiter) {
 	struct transaction *transaction = current_transaction();
 	struct tx_list2_entry *entry;
 	int ret;
@@ -313,7 +342,7 @@ static int tx_list2_add_locked(struct tx_list2_entry_ref * cursor, struct tx_lis
 		cursor->transaction = transaction;
 		list_add(&entry->spec, &head->spec_list);
 	} else {
-		ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE);
+		ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE, waiter);
 		if (ret)
 			return ret;
 		entry = &cursor->entry;
@@ -331,11 +360,19 @@ static int tx_list2_add_locked(struct tx_list2_entry_ref * cursor, struct tx_lis
 }
 
 int tx_list2_add(struct tx_list2_entry_ref * cursor, struct tx_list2_head * head) {
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	spin_lock(&head->lock);
-	ret = tx_list2_add_locked(cursor, head, false);
+	ret = tx_list2_add_locked(cursor, head, false, &waiter);
 	spin_unlock(&head->lock);
+	if (waiter) {
+		ret = transaction_wait_on_cleanup(waiter);
+		if (!ret)
+			goto retry;
+	}
 
 	return ret;
 }
@@ -343,11 +380,19 @@ EXPORT_SYMBOL_GPL(tx_list2_add);
 
 int tx_list2_add_tail(struct tx_list2_entry_ref * cursor, struct tx_list2_head * head)
 {
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	spin_lock(&head->lock);
-	ret = tx_list2_add_locked(cursor, head, true);
+	ret = tx_list2_add_locked(cursor, head, true, &waiter);
 	spin_unlock(&head->lock);
+	if (waiter) {
+		ret = transaction_wait_on_cleanup(waiter);
+		if (!ret)
+			goto retry;
+	}
 
 	return ret;
 }
@@ -358,7 +403,8 @@ EXPORT_SYMBOL_GPL(tx_list2_add_tail);
    can restore visibility. 
    If deleting a speculative add from the same transaction, remove and free
    it immediately. */
-static int tx_list2_del_locked(struct tx_list2_entry_ref * cursor) {
+static int tx_list2_del_locked(struct tx_list2_entry_ref *cursor,
+			       struct transaction **waiter) {
 	struct transaction *transaction = current_transaction();
 	struct tx_list2_entry *entry;
 	struct tx_list2_head *head;
@@ -394,7 +440,7 @@ static int tx_list2_del_locked(struct tx_list2_entry_ref * cursor) {
 		return 0;
 	}
 
-	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE);
+	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE, waiter);
 	if (ret)
 		return ret;
 
@@ -409,8 +455,11 @@ static int tx_list2_del_locked(struct tx_list2_entry_ref * cursor) {
 int tx_list2_del(struct tx_list2_entry_ref * cursor) {
 	struct tx_list2_entry *entry;
 	struct tx_list2_head *head;
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	entry = cursor->transaction == current_transaction() && cursor->sentry ?
 		cursor->sentry : &cursor->entry;
 	head = entry->parent;
@@ -418,8 +467,13 @@ int tx_list2_del(struct tx_list2_entry_ref * cursor) {
 		return 0;
 
 	spin_lock(&head->lock);
-	ret = tx_list2_del_locked(cursor);
+	ret = tx_list2_del_locked(cursor, &waiter);
 	spin_unlock(&head->lock);
+	if (waiter) {
+		ret = transaction_wait_on_cleanup(waiter);
+		if (!ret)
+			goto retry;
+	}
 
 	return ret;
 }
@@ -437,12 +491,20 @@ int tx_list2_move(struct tx_list2_entry_ref * cursor, struct tx_list2_head * hea
 EXPORT_SYMBOL_GPL(tx_list2_move);
 
 int tx_list2_get_iterator(struct tx_list2_iterator * iter, struct tx_list2_head * head) {
+	struct transaction *waiter;
 	int ret;
 
+retry:
+	waiter = NULL;
 	spin_lock(&head->lock);
-	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ);
+	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ, &waiter);
 	if (ret) {
 		spin_unlock(&head->lock);
+		if (waiter) {
+			ret = transaction_wait_on_cleanup(waiter);
+			if (!ret)
+				goto retry;
+		}
 		return ret;
 	}
 

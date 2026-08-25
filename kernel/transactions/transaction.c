@@ -609,6 +609,7 @@ static int transaction_finish_workset(struct transaction *transaction) {
 	enum transaction_state status;
 	bool commit = false;
 	int validation_ret = 0;
+	int callback_ret;
 	int ret;
 
 	if (!transaction)
@@ -657,16 +658,16 @@ static int transaction_finish_workset(struct transaction *transaction) {
 			spin_lock_nest_lock(&node->tx_obj->lock, &first_node->tx_obj->lock);
 	}
 
-	// TODO: Enable optional validation after transactional objects expose validate().
-	// if (transaction_status(transaction) == TRANSACTION_ACTIVE) {
-	// 	skiplist_for_each_entry(node, &workset, workset_list) {
-	// 		if (!node->validate)
-	// 			continue;
-	// 		callback_ret = node->validate(node);
-	// 		if (callback_ret && !validation_ret)
-	// 			validation_ret = callback_ret < 0 ? callback_ret : -EINVAL;
-	// 	}
-	// }
+	/* Validate one consistent, fully locked view before it can be published. */
+	if (transaction_status(transaction) == TRANSACTION_ACTIVE) {
+		skiplist_for_each_entry(node, &workset, workset_list) {
+			if (!node->validate)
+				continue;
+			callback_ret = node->validate(node);
+			if (callback_ret && !validation_ret)
+				validation_ret = callback_ret < 0 ? callback_ret : -EINVAL;
+		}
+	}
 
 	/*
 	 * All object locks are held, so choose the final outcome here. An abort that is

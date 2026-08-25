@@ -64,6 +64,14 @@ struct transaction_inode_wait_context {
 	int ret;
 };
 
+struct transaction_list_wait_context {
+	struct tx_list2_head *head;
+	struct tx_list2_entry_ref *ref;
+	struct completion started;
+	struct completion done;
+	int ret;
+};
+
 enum transaction_finish_test_event {
 	TRANSACTION_FINISH_BLOCKING_LOCK = 1,
 	TRANSACTION_FINISH_NONBLOCKING_LOCK,
@@ -316,6 +324,16 @@ static int transaction_inode_wait_thread(void *data) {
 	return 0;
 }
 
+static int transaction_list_wait_thread(void *data)
+{
+	struct transaction_list_wait_context *context = data;
+
+	complete(&context->started);
+	context->ret = tx_list2_add_tail(context->ref, context->head);
+	complete(&context->done);
+	return 0;
+}
+
 static bool transaction_wait_for_task_state(struct task_struct *task, unsigned int state) {
 	unsigned int retries;
 
@@ -325,6 +343,83 @@ static bool transaction_wait_for_task_state(struct task_struct *task, unsigned i
 		usleep_range(1000, 2000);
 	}
 	return false;
+}
+
+static void transaction_list_ordinary_wait_retry_test(struct kunit *test)
+{
+	struct transaction_list_wait_context wait_context;
+	struct transaction_list_test_item transactional_item;
+	struct transaction_list_test_item ordinary_item;
+	struct tx_list2_head head;
+	struct transaction *transaction;
+	struct task_struct *waiter;
+	bool waited;
+
+	INIT_TX_LIST2_HEAD(&head);
+	transaction_list_test_item_init(&transactional_item, 1);
+	transaction_list_test_item_init(&ordinary_item, 2);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&transactional_item.link, &head), 0);
+	wait_context = (struct transaction_list_wait_context) {
+		.head = &head,
+		.ref = &ordinary_item.link,
+		.ret = -EINPROGRESS,
+	};
+	init_completion(&wait_context.started);
+	init_completion(&wait_context.done);
+	waiter = kthread_run(transaction_list_wait_thread, &wait_context,
+			     "transaction-list-wait-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, waiter);
+	wait_for_completion(&wait_context.started);
+	waited = transaction_wait_for_task_state(waiter, TASK_KILLABLE);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	transaction_test_finish_current(transaction);
+	wait_for_completion(&wait_context.done);
+	kthread_stop(waiter);
+	KUNIT_EXPECT_TRUE(test, waited);
+	KUNIT_EXPECT_EQ(test, wait_context.ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 2);
+	KUNIT_EXPECT_EQ(test, tx_list2_del(&transactional_item.link), 0);
+	KUNIT_EXPECT_EQ(test, tx_list2_del(&ordinary_item.link), 0);
+}
+
+static void transaction_list_waits_for_abort_cleanup_test(struct kunit *test)
+{
+	struct transaction_list_wait_context wait_context;
+	struct transaction_list_test_item transactional_item;
+	struct transaction_list_test_item ordinary_item;
+	struct tx_list2_head head;
+	struct transaction *transaction;
+	struct task_struct *waiter;
+
+	INIT_TX_LIST2_HEAD(&head);
+	transaction_list_test_item_init(&transactional_item, 1);
+	transaction_list_test_item_init(&ordinary_item, 2);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, tx_list2_add_tail(&transactional_item.link, &head), 0);
+	wait_context = (struct transaction_list_wait_context) {
+		.head = &head,
+		.ref = &ordinary_item.link,
+		.ret = -EINPROGRESS,
+	};
+	init_completion(&wait_context.started);
+	init_completion(&wait_context.done);
+	waiter = kthread_run(transaction_list_wait_thread, &wait_context,
+			     "transaction-list-abort-wait-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, waiter);
+	wait_for_completion(&wait_context.started);
+	KUNIT_ASSERT_TRUE(test, transaction_wait_for_task_state(waiter, TASK_KILLABLE));
+	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
+	msleep(20);
+	KUNIT_EXPECT_FALSE(test, completion_done(&wait_context.done));
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	transaction_test_finish_current(transaction);
+	wait_for_completion(&wait_context.done);
+	kthread_stop(waiter);
+	KUNIT_EXPECT_EQ(test, wait_context.ret, 0);
+	KUNIT_EXPECT_EQ(test, transaction_list_test_count(&head), 1);
+	KUNIT_EXPECT_TRUE(test, tx_list2_unreferenced(&transactional_item.link));
+	KUNIT_EXPECT_EQ(test, tx_list2_del(&ordinary_item.link), 0);
 }
 
 static int transaction_contention_test_init(struct kunit *test,
@@ -1076,7 +1171,7 @@ static void transaction_asymmetric_inode_permission_wait_test(struct kunit *test
 static void transaction_finish_order_test(struct kunit *test) {
 	static const unsigned int insertion_order[] = { 1, 0 };
 	static const int expected_events[] = {
-		1, 11, 2, 12, 4, 14, 15, 5, 16, 6, 7, 17,
+		1, 11, 2, 12, 3, 13, 4, 14, 15, 5, 16, 6, 7, 17,
 	};
 	struct transaction_finish_test_context contexts[2];
 	struct transaction_finish_test_log log = { };
@@ -1121,8 +1216,8 @@ static void transaction_finish_order_test(struct kunit *test) {
 		KUNIT_EXPECT_EQ(test, log.events[i], expected_events[i]);
 
 	for (i = 0; i < ARRAY_SIZE(contexts); i++) {
-		KUNIT_EXPECT_FALSE(test, contexts[i].validate_locked);
-		KUNIT_EXPECT_FALSE(test, contexts[i].validate_owned);
+		KUNIT_EXPECT_TRUE(test, contexts[i].validate_locked);
+		KUNIT_EXPECT_TRUE(test, contexts[i].validate_owned);
 		KUNIT_EXPECT_TRUE(test, contexts[i].commit_locked);
 		KUNIT_EXPECT_TRUE(test, contexts[i].commit_unowned);
 		KUNIT_EXPECT_TRUE(test, contexts[i].release_unlocked);
@@ -1248,6 +1343,59 @@ static void __maybe_unused transaction_validation_failure_test(struct kunit *tes
 	KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
 	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
 	KUNIT_EXPECT_TRUE(test, list_empty(&object.readers));
+	transaction_put(transaction);
+}
+
+static void transaction_version_validation_failure_test(struct kunit *test)
+{
+	struct transaction_workset_test_context context = { };
+	struct txobj_thread_list_node *node;
+	struct transaction_object object;
+	struct transaction *transaction;
+	unsigned long original;
+
+	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+	node = transaction_workset_node_alloc(&context, &original, &object,
+					     TRANSACTION_OBJECT_CUSTOM,
+					     TRANSACTION_ACCESS_READ_WRITE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, node);
+	node->validate = transaction_object_validate;
+	node->commit = transaction_workset_commit;
+	node->abort = transaction_workset_abort;
+	node->release = transaction_workset_release;
+	KUNIT_ASSERT_EQ(test, transaction_workset_add(transaction, node), 0);
+	KUNIT_ASSERT_EQ(test, transaction_object_acquire(transaction, node,
+						 TRANSACTION_ACCESS_READ_WRITE, NULL), 0);
+
+	/* Model a committed-version replacement detected at the commit barrier. */
+	object.version++;
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ESTALE);
+	KUNIT_EXPECT_EQ(test, context.commit_count, 0);
+	KUNIT_EXPECT_EQ(test, context.abort_count, 1);
+	KUNIT_EXPECT_EQ(test, context.release_count, 1);
+	KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
+	transaction_put(transaction);
+}
+
+static void transaction_lifecycle_stress_test(struct kunit *test)
+{
+	struct transaction *transaction;
+	unsigned int i;
+
+	transaction = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	for (i = 0; i < 256; i++) {
+		KUNIT_ASSERT_EQ(test, begin_transaction(transaction), 0);
+		if (i & 1)
+			KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
+		KUNIT_EXPECT_EQ(test, end_transaction(transaction),
+				i & 1 ? -ECANCELED : 0);
+		KUNIT_EXPECT_TRUE(test, inactive_transaction(transaction));
+		KUNIT_EXPECT_EQ(test, atomic_read(&transaction->finishing), 0);
+	}
 	transaction_put(transaction);
 }
 
@@ -2555,11 +2703,14 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_asymmetric_wait_test),
 	KUNIT_CASE(transaction_asymmetric_inode_snapshot_test),
 	KUNIT_CASE(transaction_asymmetric_inode_permission_wait_test),
+	KUNIT_CASE(transaction_list_ordinary_wait_retry_test),
+	KUNIT_CASE(transaction_list_waits_for_abort_cleanup_test),
 	KUNIT_CASE(transaction_finish_order_test),
 	KUNIT_CASE(transaction_finish_shared_blocking_lock_test),
 	KUNIT_CASE(transaction_abort_before_final_commit_test),
-	// TODO: Re-enable when transaction_finish_workset() runs optional validation callbacks.
-	// KUNIT_CASE(transaction_validation_failure_test),
+	KUNIT_CASE(transaction_validation_failure_test),
+	KUNIT_CASE(transaction_version_validation_failure_test),
+	KUNIT_CASE(transaction_lifecycle_stress_test),
 	{}
 };
 

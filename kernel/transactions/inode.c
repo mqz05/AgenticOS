@@ -385,6 +385,26 @@ static int transaction_inode_abort(struct txobj_thread_list_node *node) {
 	return 0;
 }
 
+static int transaction_inode_validate(struct txobj_thread_list_node *node)
+{
+	struct _inode *contents = node->shadow_obj;
+	struct _inode *baseline;
+	struct inode *inode = node->orig_obj;
+	int ret = transaction_object_validate(node);
+
+	if (ret)
+		return ret;
+	if (!contents)
+		return -ESTALE;
+	baseline = node->rw == TRANSACTION_ACCESS_READ ? contents : contents->shadow;
+	if (!baseline || baseline != rcu_dereference_protected(inode->i_contents,
+							lockdep_is_held(&inode->i_lock)))
+		return -ESTALE;
+	if (!transaction_inode_matches_stable(baseline, inode))
+		return -ESTALE;
+	return 0;
+}
+
 /* The generic workset owns the entry, this adapter owns the inode reference. */
 static int transaction_inode_release(struct txobj_thread_list_node *node, int early) {
 	struct inode *inode = node->orig_obj;
@@ -403,6 +423,7 @@ static void transaction_inode_setup_node(struct txobj_thread_list_node *node) {
 
 	node->lock = transaction_inode_lock;
 	node->unlock = transaction_inode_unlock;
+	node->validate = transaction_inode_validate;
 	node->commit = transaction_inode_commit;
 	node->abort = transaction_inode_abort;
 	node->release = transaction_inode_release;

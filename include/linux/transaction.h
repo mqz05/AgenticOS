@@ -142,6 +142,8 @@ struct txobj_thread_list_node {
 	void *orig_obj;
 	struct transaction_object *tx_obj;
 	enum transaction_access_mode rw;
+	// Object version observed when ownership was first published.
+	u64 version;
 	// Previous workset node in final object-lock order.
 	struct txobj_thread_list_node *ordered_lock_prev;
 	// Shared native locks are acquired once across object and list adapters.
@@ -150,10 +152,7 @@ struct txobj_thread_list_node {
 	spinlock_t *nonblocking_nest_lock;
 	bool blocking_lock_acquired;
 	bool nonblocking_lock_acquired;
-	/*
-	 * TODO: Optional validation may return an errno to abort before commit. The
-	 * other callbacks are expected to succeed; nonzero returns warn.
-	 */
+	/* Validation runs with every ordered native and object lock held. */
 	int (*validate)(struct txobj_thread_list_node *node);
 	int (*lock)(struct txobj_thread_list_node *node, int blocking);
 	int (*unlock)(struct txobj_thread_list_node *node, int blocking);
@@ -167,10 +166,14 @@ int transaction_object_acquire(struct transaction *transaction,
 			       struct txobj_thread_list_node *node,
 			       enum transaction_access_mode mode,
 			       bool *should_sleep);
+int transaction_object_validate(struct txobj_thread_list_node *node);
 struct transaction *transaction_check_asymmetric_conflict(struct transaction_object *object,
 							   enum transaction_access_mode mode,
 							   bool can_sleep, int *error);
+struct transaction *transaction_object_conflict_get(struct transaction_object *object,
+							     enum transaction_access_mode mode);
 int transaction_wait_on_conflict(struct transaction *winner);
+int transaction_wait_on_cleanup(struct transaction *winner);
 void transaction_object_remove_ownership_locked(struct txobj_thread_list_node *node);
 void transaction_object_remove_ownership(struct txobj_thread_list_node *node);
 

@@ -258,6 +258,30 @@ static int transaction_dentry_abort(struct txobj_thread_list_node *node) {
 	return 0;
 }
 
+static int transaction_dentry_validate(struct txobj_thread_list_node *node)
+{
+	struct _dentry *contents = node->shadow_obj;
+	struct _dentry *baseline;
+	struct dentry *dentry = node->orig_obj;
+	int ret = transaction_object_validate(node);
+
+	if (ret)
+		return ret;
+	if (!contents)
+		return -ESTALE;
+	baseline = node->rw == TRANSACTION_ACCESS_READ ? contents : contents->shadow;
+	if (!baseline || baseline != rcu_dereference_protected(dentry->d_contents,
+							lockdep_is_held(&dentry->d_lock)))
+		return -ESTALE;
+	/*
+	 * Stable dentry flags may receive disjoint ordinary updates while the
+	 * private version is live.  transaction_dentry_finish_metadata() merges
+	 * those bits at publication, so the committed pointer and object version,
+	 * rather than byte-for-byte stable metadata, form the validation boundary.
+	 */
+	return 0;
+}
+
 static int transaction_dentry_release(struct txobj_thread_list_node *node, int early) {
 	struct dentry *dentry = node->orig_obj;
 	struct _dentry *shadow = node->shadow_obj;
@@ -353,6 +377,7 @@ static void transaction_dentry_setup_node(struct txobj_thread_list_node *node) {
 
 	node->lock = transaction_dentry_lock;
 	node->unlock = transaction_dentry_unlock;
+	node->validate = transaction_dentry_validate;
 	node->commit = transaction_dentry_commit;
 	node->abort = transaction_dentry_abort;
 	node->release = transaction_dentry_release;

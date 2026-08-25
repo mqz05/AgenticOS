@@ -13,6 +13,7 @@
 /* Transaction-local snapshot of file state. For now we only preserve f_pos,
    which is the current offset for read/write/lseek on this open file. */
 struct transaction_file_shadow {
+	loff_t committed_pos;
 	loff_t f_pos;
 };
 
@@ -29,7 +30,21 @@ static int transaction_file_commit(struct txobj_thread_list_node * node) {
 	struct file *file = node->orig_obj;
 
 	file->f_pos = shadow->f_pos;
+	node->tx_obj->version++;
 
+	return 0;
+}
+
+static int transaction_file_validate(struct txobj_thread_list_node *node)
+{
+	struct transaction_file_shadow *shadow = node->shadow_obj;
+	struct file *file = node->orig_obj;
+	int ret = transaction_object_validate(node);
+
+	if (ret)
+		return ret;
+	if (!shadow || file->f_pos != shadow->committed_pos)
+		return -ESTALE;
 	return 0;
 }
 
@@ -126,6 +141,7 @@ int transaction_file_snapshot(struct file * file) {
 	if (!shadow)
 		return -ENOMEM;
 
+	shadow->committed_pos = file->f_pos;
 	shadow->f_pos = file->f_pos;
 	node = transaction_workset_node_alloc(
 		shadow,
@@ -144,6 +160,7 @@ int transaction_file_snapshot(struct file * file) {
 	   commit publishes that offset and abort discards it. */
 	node->lock = transaction_file_lock;
 	node->unlock = transaction_file_unlock;
+	node->validate = transaction_file_validate;
 	node->commit = transaction_file_commit;
 	node->release = transaction_file_release;
 	node->blocking_lock_id = file->f_mode & FMODE_ATOMIC_POS ? &file->f_pos_lock : NULL;

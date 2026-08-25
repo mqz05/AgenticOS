@@ -525,6 +525,7 @@ static int tx_hlist_commit(struct txobj_thread_list_node *node) {
 	struct transaction *transaction = node->tx;
 	struct tx_hlist_spec_entry *entry;
 	struct tx_hlist_spec_entry *next;
+	bool changed = false;
 
 	list_for_each_entry_safe_reverse(entry, next, &state->spec_list, spec) {
 		struct tx_hlist_ref_state *cursor;
@@ -534,6 +535,7 @@ static int tx_hlist_commit(struct txobj_thread_list_node *node) {
 		cursor = entry->cursor;
 		spin_lock(&cursor->lock);
 		if (cursor->transaction == transaction && cursor->sentry == entry) {
+			changed = true;
 			if (entry->state == TX_HLIST_TRANSACTIONAL_ADD) {
 				if (!tx_hlist_ref_unhashed(cursor))
 					tx_hlist_ref_del_init(cursor);
@@ -552,6 +554,8 @@ static int tx_hlist_commit(struct txobj_thread_list_node *node) {
 		tx_hlist_retire_spec(entry);
 		spin_unlock(&cursor->lock);
 	}
+	if (changed)
+		node->tx_obj->version++;
 	tx_hlist_finish_mode(node);
 	return 0;
 }
@@ -585,6 +589,18 @@ static int tx_hlist_abort(struct txobj_thread_list_node *node) {
 		spin_unlock(&cursor->lock);
 	}
 	tx_hlist_finish_mode(node);
+	return 0;
+}
+
+static int tx_hlist_validate(struct txobj_thread_list_node *node)
+{
+	struct tx_hlist_head_state *state = tx_hlist_node_state(node);
+	int ret = transaction_object_validate(node);
+
+	if (ret)
+		return ret;
+	if (state->mode == TX_HLIST_NO_TX)
+		return -ESTALE;
 	return 0;
 }
 
@@ -676,6 +692,7 @@ static int tx_hlist_acquire(struct tx_hlist_head_state *state, enum transaction_
 	}
 	node->lock = tx_hlist_lock;
 	node->unlock = tx_hlist_unlock;
+	node->validate = tx_hlist_validate;
 	node->commit = tx_hlist_commit;
 	node->abort = tx_hlist_abort;
 	node->release = tx_hlist_release;

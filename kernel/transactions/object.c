@@ -16,6 +16,33 @@ void transaction_object_init(struct transaction_object *object, enum transaction
 }
 EXPORT_SYMBOL_GPL(transaction_object_init);
 
+/* Validate the generic ownership and version observed by a workset node. */
+int transaction_object_validate(struct txobj_thread_list_node *node)
+{
+	struct transaction_object *object;
+	struct txobj_thread_list_node *reader;
+	bool found = false;
+
+	if (!node || !node->tx || !node->tx_obj)
+		return -EINVAL;
+	object = node->tx_obj;
+	lockdep_assert_held(&object->lock);
+	if (node->version != object->version)
+		return -ESTALE;
+	list_for_each_entry(reader, &object->readers, object_list) {
+		if (reader == node && reader->tx == node->tx) {
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return -ESTALE;
+	if (node->rw == TRANSACTION_ACCESS_READ_WRITE && object->writer != node->tx)
+		return -ESTALE;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_object_validate);
+
 // Called with object->lock held.
 static struct txobj_thread_list_node *object_find_reader(struct transaction_object *object, struct transaction *transaction) {
 	struct txobj_thread_list_node *node;
@@ -189,6 +216,31 @@ out:
 }
 EXPORT_SYMBOL_GPL(transaction_check_asymmetric_conflict);
 
+/* Return any conflicting owner. Callers use this when takeover is unsafe. */
+struct transaction *transaction_object_conflict_get(struct transaction_object *object,
+							     enum transaction_access_mode mode)
+{
+	struct txobj_thread_list_node *reader;
+	struct transaction *owner = NULL;
+
+	if (!object || (mode != TRANSACTION_ACCESS_READ &&
+			mode != TRANSACTION_ACCESS_READ_WRITE))
+		return NULL;
+	spin_lock(&object->lock);
+	if (mode == TRANSACTION_ACCESS_READ) {
+		owner = object->writer;
+	} else if (!list_empty(&object->readers)) {
+		reader = list_first_entry(&object->readers,
+					  struct txobj_thread_list_node, object_list);
+		owner = reader->tx;
+	}
+	if (owner)
+		transaction_get(owner);
+	spin_unlock(&object->lock);
+	return owner;
+}
+EXPORT_SYMBOL_GPL(transaction_object_conflict_get);
+
 // Wait for the winning transaction to finish and consume its reference.
 int transaction_wait_on_conflict(struct transaction *winner) {
 	enum transaction_state status;
@@ -208,12 +260,31 @@ int transaction_wait_on_conflict(struct transaction *winner) {
 }
 EXPORT_SYMBOL_GPL(transaction_wait_on_conflict);
 
+/* Wait until ownership cleanup is complete, not merely until abort is marked. */
+int transaction_wait_on_cleanup(struct transaction *winner)
+{
+	u64 timestamp;
+	int ret;
+
+	if (!winner)
+		return -EINVAL;
+	timestamp = READ_ONCE(winner->timestamp);
+	ret = wait_event_killable(winner->losers,
+		transaction_status(winner) == TRANSACTION_INACTIVE ||
+		READ_ONCE(winner->timestamp) != timestamp);
+	transaction_put(winner);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(transaction_wait_on_cleanup);
+
 static int transaction_object_lose(struct transaction *transaction, bool can_sleep, bool *should_sleep) {
 	int ret;
 
 	/*
-	 * should_sleep only reports that waiting and retrying would be allowed.
-	 * TODO: The current acquire API has no wait/retry loop, so the loser is aborted.
+	 * A transactional loser cannot continue from the failed acquisition: its
+	 * earlier speculative work must first be rolled back.  Report whether the
+	 * eventual execution-retry path may wait for the winner; register/context
+	 * restoration is supplied by the userspace transaction ABI.
 	 */
 	if (should_sleep)
 		*should_sleep = can_sleep;
@@ -339,6 +410,7 @@ publish:
 	if (!existing) {
 		list_add(&node->object_list, &object->readers);
 		node->rw = mode;
+		node->version = object->version;
 	} else if (node->rw < mode) {
 		node->rw = mode;
 	}
