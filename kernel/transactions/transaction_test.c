@@ -1972,6 +1972,72 @@ static void transaction_file_offset_commit_test(struct kunit *test) {
 	fput(file);
 }
 
+static void transaction_file_flags_abort_test(struct kunit *test)
+{
+	struct transaction *transaction;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-file-flags-test]",
+				  &transaction_test_file_operations, NULL, O_RDWR);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_file_set_flags(file,
+			O_APPEND | O_NONBLOCK, O_APPEND | O_NONBLOCK), 0);
+	KUNIT_EXPECT_EQ(test,
+		transaction_file_get_flags(file) & (O_APPEND | O_NONBLOCK),
+		(unsigned int)(O_APPEND | O_NONBLOCK));
+	KUNIT_EXPECT_EQ(test, file->f_flags & (O_APPEND | O_NONBLOCK), 0U);
+	KUNIT_EXPECT_TRUE(test,
+		transaction_file_get_iocb_flags(file) & IOCB_APPEND);
+	KUNIT_ASSERT_EQ(test, abort_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ECANCELED);
+	KUNIT_EXPECT_EQ(test, file->f_flags & (O_APPEND | O_NONBLOCK), 0U);
+	KUNIT_EXPECT_FALSE(test, file->f_iocb_flags & IOCB_APPEND);
+	transaction_test_finish_current(transaction);
+	fput(file);
+}
+
+static void transaction_file_flags_commit_test(struct kunit *test)
+{
+	struct transaction *transaction;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-file-flags-test]",
+				  &transaction_test_file_operations, NULL, O_RDWR);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_file_set_flags(file,
+			O_APPEND | O_NONBLOCK, O_APPEND | O_NONBLOCK), 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), 0);
+	KUNIT_EXPECT_EQ(test,
+		file->f_flags & (O_APPEND | O_NONBLOCK),
+		(unsigned int)(O_APPEND | O_NONBLOCK));
+	KUNIT_EXPECT_TRUE(test, file->f_iocb_flags & IOCB_APPEND);
+	transaction_test_finish_current(transaction);
+	fput(file);
+}
+
+static void transaction_file_flags_validation_test(struct kunit *test)
+{
+	struct transaction *transaction;
+	struct file *file;
+
+	file = anon_inode_getfile("[transaction-file-flags-test]",
+				  &transaction_test_file_operations, NULL, O_RDWR);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	KUNIT_ASSERT_EQ(test, transaction_test_begin_current(&transaction), 0);
+	KUNIT_ASSERT_EQ(test, transaction_file_set_flags(file, O_APPEND,
+						     O_APPEND), 0);
+	spin_lock(&file->f_lock);
+	file->f_flags |= O_NONBLOCK;
+	spin_unlock(&file->f_lock);
+	KUNIT_EXPECT_EQ(test, end_transaction(transaction), -ESTALE);
+	KUNIT_EXPECT_EQ(test, file->f_flags & O_APPEND, 0U);
+	KUNIT_EXPECT_TRUE(test, file->f_flags & O_NONBLOCK);
+	transaction_test_finish_current(transaction);
+	fput(file);
+}
+
 static void transaction_inode_metadata_abort_test(struct kunit *test) {
 	struct _inode *shadow_inode;
 	struct transaction *transaction;
@@ -2758,6 +2824,9 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_list_move_commit_test),
 	KUNIT_CASE(transaction_file_offset_abort_test),
 	KUNIT_CASE(transaction_file_offset_commit_test),
+	KUNIT_CASE(transaction_file_flags_abort_test),
+	KUNIT_CASE(transaction_file_flags_commit_test),
+	KUNIT_CASE(transaction_file_flags_validation_test),
 	KUNIT_CASE(transaction_inode_metadata_abort_test),
 	KUNIT_CASE(transaction_inode_metadata_commit_test),
 	KUNIT_CASE(transaction_inode_blocks_test),

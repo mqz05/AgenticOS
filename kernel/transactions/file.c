@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Transactional VFS file-object support.
-   This currently handles per-open-file offset rollback. More file-local
-   state can be added here later without changing the generic workset layer. */
+/*
+ * Transactional VFS open-file-description support.  Offset and mutable
+ * status flags live in the transaction shadow; stable identity fields are
+ * captured so commit-time validation detects an invalidated description.
+ */
 
 #include <linux/errno.h>
 #include <linux/export.h>
@@ -10,12 +12,45 @@
 #include <linux/slab.h>
 #include <linux/transaction.h>
 
-/* Transaction-local snapshot of file state. For now we only preserve f_pos,
-   which is the current offset for read/write/lseek on this open file. */
+/*
+ * Modern counterpart of TxOS struct _file.  Lifetime and subsystem-private
+ * state remain in struct file; semantically visible open-file-description
+ * state is copied here and published atomically at commit.
+ */
 struct transaction_file_shadow {
 	loff_t committed_pos;
 	loff_t f_pos;
+	fmode_t committed_mode;
+	fmode_t f_mode;
+	unsigned int committed_flags;
+	unsigned int f_flags;
+	unsigned int committed_iocb_flags;
+	unsigned int f_iocb_flags;
+	const struct file_operations *committed_op;
+	struct address_space *committed_mapping;
+	struct inode *committed_inode;
+	const struct cred *committed_cred;
+	struct vfsmount *committed_mnt;
+	struct dentry *committed_dentry;
+#ifdef CONFIG_SECURITY
+	void *committed_security;
+#endif
 };
+
+static unsigned int transaction_iocb_flags(unsigned int flags)
+{
+	unsigned int result = 0;
+
+	if (flags & O_APPEND)
+		result |= IOCB_APPEND;
+	if (flags & O_DIRECT)
+		result |= IOCB_DIRECT;
+	if (flags & O_DSYNC)
+		result |= IOCB_DSYNC;
+	if (flags & __O_SYNC)
+		result |= IOCB_SYNC;
+	return result;
+}
 
 /* Initialize the generic transaction object embedded in the file struct. */
 void transaction_file_init(struct file * file) {
@@ -23,13 +58,14 @@ void transaction_file_init(struct file * file) {
 }
 EXPORT_SYMBOL_GPL(transaction_file_init);
 
-/* Commit callback for file workset entries.
-   Publish the transaction-local file offset once the transaction commits. */
+/* Publish transaction-local open-file-description state at commit. */
 static int transaction_file_commit(struct txobj_thread_list_node * node) {
 	struct transaction_file_shadow * shadow = node->shadow_obj;
 	struct file *file = node->orig_obj;
 
 	file->f_pos = shadow->f_pos;
+	file->f_flags = shadow->f_flags;
+	file->f_iocb_flags = shadow->f_iocb_flags;
 	node->tx_obj->version++;
 
 	return 0;
@@ -43,7 +79,20 @@ static int transaction_file_validate(struct txobj_thread_list_node *node)
 
 	if (ret)
 		return ret;
-	if (!shadow || file->f_pos != shadow->committed_pos)
+	if (!shadow || file->f_pos != shadow->committed_pos ||
+	    file->f_mode != shadow->committed_mode ||
+	    file->f_flags != shadow->committed_flags ||
+	    file->f_iocb_flags != shadow->committed_iocb_flags ||
+	    file->f_op != shadow->committed_op ||
+	    file->f_mapping != shadow->committed_mapping ||
+	    file->f_inode != shadow->committed_inode ||
+	    file->f_cred != shadow->committed_cred ||
+	    file->f_path.mnt != shadow->committed_mnt ||
+	    file->f_path.dentry != shadow->committed_dentry
+#ifdef CONFIG_SECURITY
+	    || file->f_security != shadow->committed_security
+#endif
+	   )
 		return -ESTALE;
 	return 0;
 }
@@ -55,6 +104,8 @@ static int transaction_file_lock(struct txobj_thread_list_node * node, int block
 
 	if (blocking && file->f_mode & FMODE_ATOMIC_POS)
 		mutex_lock(&file->f_pos_lock);
+	else if (!blocking)
+		spin_lock(&file->f_lock);
 
 	return 0;
 }
@@ -65,6 +116,8 @@ static int transaction_file_unlock(struct txobj_thread_list_node * node, int blo
 
 	if (blocking && file->f_mode & FMODE_ATOMIC_POS)
 		mutex_unlock(&file->f_pos_lock);
+	else if (!blocking)
+		spin_unlock(&file->f_lock);
 
 	return 0;
 }
@@ -103,9 +156,59 @@ loff_t transaction_file_get_pos(struct file * file) {
 }
 EXPORT_SYMBOL_GPL(transaction_file_get_pos);
 
-/* Add this file to the current transaction's workset and snapshot its current offset.
-   Ordinary accesses resolve asymmetric ownership before using the stable offset.
-   If the file is already in the workset, the existing shadow offset is reused. */
+static struct transaction_file_shadow *transaction_file_shadow(struct file *file)
+{
+	struct txobj_thread_list_node *node;
+	struct transaction *transaction = current_transaction();
+
+	if (!transaction)
+		return NULL;
+	node = transaction_workset_find_object(transaction,
+					       &file->transaction_object);
+	return node ? node->shadow_obj : NULL;
+}
+
+static struct transaction_file_shadow *transaction_file_visible_shadow(struct file *file)
+{
+	struct transaction_file_shadow *shadow;
+
+	shadow = transaction_file_shadow(file);
+	if (!shadow && current_transaction()) {
+		if (transaction_file_snapshot(file))
+			return NULL;
+		shadow = transaction_file_shadow(file);
+	}
+	return shadow;
+}
+
+unsigned int transaction_file_get_flags(struct file *file)
+{
+	struct transaction_file_shadow *shadow = transaction_file_visible_shadow(file);
+
+	return shadow ? shadow->f_flags : READ_ONCE(file->f_flags);
+}
+EXPORT_SYMBOL_GPL(transaction_file_get_flags);
+
+unsigned int transaction_file_get_iocb_flags(struct file *file)
+{
+	struct transaction_file_shadow *shadow = transaction_file_visible_shadow(file);
+
+	return shadow ? shadow->f_iocb_flags : READ_ONCE(file->f_iocb_flags);
+}
+EXPORT_SYMBOL_GPL(transaction_file_get_iocb_flags);
+
+fmode_t transaction_file_get_mode(struct file *file)
+{
+	struct transaction_file_shadow *shadow = transaction_file_visible_shadow(file);
+
+	return shadow ? shadow->f_mode : READ_ONCE(file->f_mode);
+}
+EXPORT_SYMBOL_GPL(transaction_file_get_mode);
+
+/*
+ * Add this file to the workset and snapshot its open-file-description state.
+ * If it is already present, reuse the existing shadow.
+ */
 int transaction_file_snapshot(struct file * file) {
 	struct txobj_thread_list_node * node;
 	struct transaction_file_shadow * shadow;
@@ -141,8 +244,25 @@ int transaction_file_snapshot(struct file * file) {
 	if (!shadow)
 		return -ENOMEM;
 
+	spin_lock(&file->f_lock);
 	shadow->committed_pos = file->f_pos;
 	shadow->f_pos = file->f_pos;
+	shadow->committed_mode = file->f_mode;
+	shadow->f_mode = file->f_mode;
+	shadow->committed_flags = file->f_flags;
+	shadow->f_flags = file->f_flags;
+	shadow->committed_iocb_flags = file->f_iocb_flags;
+	shadow->f_iocb_flags = file->f_iocb_flags;
+	shadow->committed_op = file->f_op;
+	shadow->committed_mapping = file->f_mapping;
+	shadow->committed_inode = file->f_inode;
+	shadow->committed_cred = file->f_cred;
+	shadow->committed_mnt = file->f_path.mnt;
+	shadow->committed_dentry = file->f_path.dentry;
+#ifdef CONFIG_SECURITY
+	shadow->committed_security = file->f_security;
+#endif
+	spin_unlock(&file->f_lock);
 	node = transaction_workset_node_alloc(
 		shadow,
 		file,
@@ -164,6 +284,8 @@ int transaction_file_snapshot(struct file * file) {
 	node->commit = transaction_file_commit;
 	node->release = transaction_file_release;
 	node->blocking_lock_id = file->f_mode & FMODE_ATOMIC_POS ? &file->f_pos_lock : NULL;
+	node->nonblocking_lock_id = &file->f_lock;
+	node->nonblocking_nest_lock = &file->f_lock;
 	get_file(file);
 	ret = transaction_workset_add(transaction, node);
 	if (ret)
@@ -227,3 +349,41 @@ int transaction_file_set_pos(struct file * file, loff_t pos) {
 	return 0;
 }
 EXPORT_SYMBOL_GPL(transaction_file_set_pos);
+
+int transaction_file_set_flags(struct file *file, unsigned int flags,
+			       unsigned int mask)
+{
+	struct transaction_file_shadow *shadow;
+	struct transaction *winner;
+	int ret;
+
+	if (!file)
+		return -EINVAL;
+	if (!current_transaction()) {
+		winner = transaction_check_asymmetric_conflict(&file->transaction_object,
+						       TRANSACTION_ACCESS_READ_WRITE,
+						       false, &ret);
+		if (WARN_ON_ONCE(winner)) {
+			transaction_put(winner);
+			return -EUCLEAN;
+		}
+		if (ret)
+			return ret;
+		spin_lock(&file->f_lock);
+		file->f_flags = (file->f_flags & ~mask) | (flags & mask);
+		file->f_iocb_flags = iocb_flags(file);
+		spin_unlock(&file->f_lock);
+		return 0;
+	}
+
+	ret = transaction_file_snapshot(file);
+	if (ret)
+		return ret;
+	shadow = transaction_file_shadow(file);
+	if (!shadow)
+		return -EUCLEAN;
+	shadow->f_flags = (shadow->f_flags & ~mask) | (flags & mask);
+	shadow->f_iocb_flags = transaction_iocb_flags(shadow->f_flags);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_file_set_flags);

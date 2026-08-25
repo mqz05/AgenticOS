@@ -39,17 +39,18 @@
 static int setfl(int fd, struct file * filp, unsigned int arg)
 {
 	struct inode * inode = file_inode(filp);
+	unsigned int old_flags = transaction_file_get_flags(filp);
 	int error = 0;
 
 	/*
 	 * O_APPEND cannot be cleared if the file is marked as append-only
 	 * and the file is open for write.
 	 */
-	if (((arg ^ filp->f_flags) & O_APPEND) && IS_APPEND(inode))
+	if (((arg ^ old_flags) & O_APPEND) && IS_APPEND(inode))
 		return -EPERM;
 
 	/* O_NOATIME can only be set by the owner or superuser */
-	if ((arg & O_NOATIME) && !(filp->f_flags & O_NOATIME))
+	if ((arg & O_NOATIME) && !(old_flags & O_NOATIME))
 		if (!inode_owner_or_capable(file_mnt_idmap(filp), inode))
 			return -EPERM;
 
@@ -72,17 +73,16 @@ static int setfl(int fd, struct file * filp, unsigned int arg)
 	/*
 	 * ->fasync() is responsible for setting the FASYNC bit.
 	 */
-	if (((arg ^ filp->f_flags) & FASYNC) && filp->f_op->fasync) {
+	if (((arg ^ old_flags) & FASYNC) && filp->f_op->fasync) {
+		if (current_transaction())
+			return -EOPNOTSUPP;
 		error = filp->f_op->fasync(fd, filp, (arg & FASYNC) != 0);
 		if (error < 0)
 			goto out;
 		if (error > 0)
 			error = 0;
 	}
-	spin_lock(&filp->f_lock);
-	filp->f_flags = (arg & SETFL_MASK) | (filp->f_flags & ~SETFL_MASK);
-	filp->f_iocb_flags = iocb_flags(filp);
-	spin_unlock(&filp->f_lock);
+	error = transaction_file_set_flags(filp, arg, SETFL_MASK);
 
  out:
 	return error;
@@ -470,7 +470,7 @@ static long do_fcntl(int fd, unsigned int cmd, unsigned long arg,
 		set_close_on_exec(fd, argi & FD_CLOEXEC);
 		break;
 	case F_GETFL:
-		err = filp->f_flags;
+		err = transaction_file_get_flags(filp);
 		break;
 	case F_SETFL:
 		err = setfl(fd, filp, argi);

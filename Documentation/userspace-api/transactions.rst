@@ -43,6 +43,25 @@ return a failure that causes transactional rollback.  List and hlist paths
 whose speculative state cannot be taken over wait only after releasing their
 native protocol lock.
 
+File descriptions
+=================
+
+The file adapter is the Linux 6.18 counterpart of the original TxOS file
+shadow.  A transaction observes private copies of the current offset, file
+status flags, and the derived I/O-control flags.  Commit publishes those
+fields together, while abort discards them.  Duplicated descriptors share the
+same ``struct file`` and therefore the same transactional shadow.  Stable file
+identity (path, inode, mapping, operations, credentials, mode, and security
+pointer) is captured and checked by commit-time validation.
+
+Kernel-private lifetime and implementation state is deliberately not copied:
+references, driver ``private_data``, asynchronous notification ownership,
+readahead bookkeeping, and writeback error cursors remain owned by their
+native subsystems.  Transactional file data and page-cache state, mmap state,
+and membership of multiple tasks are handled by later milestones.  Changing
+``FASYNC`` from a transaction is rejected until asynchronous notification has
+a dedicated adapter.
+
 The port currently restores the syscall-entry general-register frame,
 including the user instruction pointer, stack pointer, and processor flags.
 Until userspace stack rollback is added, callers that enable execution

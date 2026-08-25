@@ -351,13 +351,7 @@ static int ioctl_fionbio(struct file *filp, int __user *argp)
 	if (O_NONBLOCK != O_NDELAY)
 		flag |= O_NDELAY;
 #endif
-	spin_lock(&filp->f_lock);
-	if (on)
-		filp->f_flags |= flag;
-	else
-		filp->f_flags &= ~flag;
-	spin_unlock(&filp->f_lock);
-	return error;
+	return transaction_file_set_flags(filp, on ? flag : 0, flag);
 }
 
 static int ioctl_fioasync(unsigned int fd, struct file *filp,
@@ -372,7 +366,9 @@ static int ioctl_fioasync(unsigned int fd, struct file *filp,
 	flag = on ? FASYNC : 0;
 
 	/* Did FASYNC state change ? */
-	if ((flag ^ filp->f_flags) & FASYNC) {
+	if ((flag ^ transaction_file_get_flags(filp)) & FASYNC) {
+		if (current_transaction())
+			return -EOPNOTSUPP;
 		if (filp->f_op->fasync)
 			/* fasync() adjusts filp->f_flags */
 			error = filp->f_op->fasync(fd, filp, on);

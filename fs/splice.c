@@ -878,7 +878,7 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 			msg.msg_flags |= MSG_MORE;
 		if (remain && pipe_occupancy(pipe->head, tail) > 0)
 			msg.msg_flags |= MSG_MORE;
-		if (out->f_flags & O_NONBLOCK)
+		if (transaction_file_get_flags(out) & O_NONBLOCK)
 			msg.msg_flags |= MSG_DONTWAIT;
 
 		iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bvec, bc,
@@ -977,7 +977,7 @@ static ssize_t do_splice_read(struct file *in, loff_t *ppos,
 	 * O_DIRECT and DAX don't deal with the pagecache, so we allocate a
 	 * buffer, copy into it and splice that into the pipe.
 	 */
-	if ((in->f_flags & O_DIRECT) || IS_DAX(in->f_mapping->host))
+	if ((transaction_file_get_flags(in) & O_DIRECT) || IS_DAX(in->f_mapping->host))
 		return copy_splice_read(in, ppos, pipe, len, flags);
 	return in->f_op->splice_read(in, ppos, pipe, len, flags);
 }
@@ -1198,7 +1198,7 @@ static ssize_t do_splice_direct_actor(struct file *in, loff_t *ppos,
 	if (unlikely(!(out->f_mode & FMODE_WRITE)))
 		return -EBADF;
 
-	if (unlikely(out->f_flags & O_APPEND))
+	if (unlikely(transaction_file_get_flags(out) & O_APPEND))
 		return -EINVAL;
 
 	ret = splice_direct_to_actor(in, &sd, actor);
@@ -1322,7 +1322,8 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 		if (ipipe == opipe)
 			return -EINVAL;
 
-		if ((in->f_flags | out->f_flags) & O_NONBLOCK)
+		if ((transaction_file_get_flags(in) |
+		     transaction_file_get_flags(out)) & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
@@ -1337,14 +1338,14 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 			offset = out->f_pos;
 		}
 
-		if (unlikely(out->f_flags & O_APPEND))
+		if (unlikely(transaction_file_get_flags(out) & O_APPEND))
 			return -EINVAL;
 
 		ret = rw_verify_area(WRITE, out, &offset, len);
 		if (unlikely(ret < 0))
 			return ret;
 
-		if (in->f_flags & O_NONBLOCK)
+		if (transaction_file_get_flags(in) & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
 		file_start_write(out);
@@ -1370,7 +1371,7 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 		if (unlikely(ret < 0))
 			return ret;
 
-		if (out->f_flags & O_NONBLOCK)
+		if (transaction_file_get_flags(out) & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
 		ret = splice_file_to_pipe(in, opipe, &offset, len, flags);
@@ -1953,7 +1954,8 @@ ssize_t do_tee(struct file *in, struct file *out, size_t len,
 	 * copying the data.
 	 */
 	if (ipipe && opipe && ipipe != opipe) {
-		if ((in->f_flags | out->f_flags) & O_NONBLOCK)
+		if ((transaction_file_get_flags(in) |
+		     transaction_file_get_flags(out)) & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
 		/*

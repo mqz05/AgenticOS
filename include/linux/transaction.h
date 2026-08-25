@@ -219,6 +219,11 @@ void transaction_file_init(struct file *file);
 loff_t transaction_file_get_pos(struct file *file);
 int transaction_file_snapshot(struct file *file);
 int transaction_file_set_pos(struct file *file, loff_t pos);
+unsigned int transaction_file_get_flags(struct file *file);
+unsigned int transaction_file_get_iocb_flags(struct file *file);
+fmode_t transaction_file_get_mode(struct file *file);
+int transaction_file_set_flags(struct file *file, unsigned int flags,
+			       unsigned int mask);
 void transaction_inode_init(struct inode *inode);
 void transaction_inode_destroy(struct inode *inode);
 struct _inode *transaction_inode_get(struct inode *inode, enum transaction_access_mode mode);
@@ -288,6 +293,14 @@ static inline struct transaction *current_transaction(void) {
 }
 static inline void transaction_syscall_exit(struct pt_regs *regs) { }
 static inline void transaction_file_init(struct file *file) { }
+#define transaction_file_get_flags(file) ((file)->f_flags)
+#define transaction_file_get_iocb_flags(file) ((file)->f_iocb_flags)
+#define transaction_file_get_mode(file) ((file)->f_mode)
+#define transaction_file_set_flags(file, flags, mask) ({			\
+	(file)->f_flags = ((file)->f_flags & ~(mask)) | ((flags) & (mask)); \
+	(file)->f_iocb_flags = iocb_flags(file);				\
+	0;								\
+})
 static inline int transaction_file_snapshot(struct file *file) {
 	return 0;
 }

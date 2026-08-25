@@ -1402,7 +1402,7 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 	 * and the application is arguably buggy if it doesn't expect
 	 * EAGAIN on a non-blocking file descriptor.
 	 */
-	if (fd_file(in)->f_flags & O_NONBLOCK)
+	if (transaction_file_get_flags(fd_file(in)) & O_NONBLOCK)
 		fl = SPLICE_F_NONBLOCK;
 #endif
 	opipe = get_pipe_info(fd_file(out), true);
@@ -1421,7 +1421,7 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 		retval = do_splice_direct(fd_file(in), &pos, fd_file(out), &out_pos,
 					  count, fl);
 	} else {
-		if (fd_file(out)->f_flags & O_NONBLOCK)
+		if (transaction_file_get_flags(fd_file(out)) & O_NONBLOCK)
 			fl |= SPLICE_F_NONBLOCK;
 
 		if (!ppos) {
@@ -1790,7 +1790,7 @@ int generic_write_check_limits(struct file *file, loff_t pos, loff_t *count)
 		*count = min(*count, limit - pos);
 	}
 
-	if (!(file->f_flags & O_LARGEFILE))
+	if (!(transaction_file_get_flags(file) & O_LARGEFILE))
 		max_size = MAX_NON_LFS;
 
 	if (unlikely(pos >= max_size))
@@ -1864,7 +1864,7 @@ int generic_file_rw_checks(struct file *file_in, struct file *file_out)
 
 	if (!(file_in->f_mode & FMODE_READ) ||
 	    !(file_out->f_mode & FMODE_WRITE) ||
-	    (file_out->f_flags & O_APPEND))
+	    (transaction_file_get_flags(file_out) & O_APPEND))
 		return -EBADF;
 
 	return 0;
