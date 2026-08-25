@@ -223,10 +223,18 @@ static int tx_list2_acquire(struct tx_list2_head *head,
 	if (waiter)
 		*waiter = NULL;
 	if (!transaction) {
-		if (waiter)
-			*waiter = transaction_object_conflict_get(&head->transaction_object,
-								  list_access);
-		return waiter && *waiter ? -EAGAIN : 0;
+		struct transaction *owner;
+
+		owner = transaction_object_conflict_get(&head->transaction_object,
+							list_access);
+		if (!owner)
+			return 0;
+		if (waiter) {
+			*waiter = owner;
+			return -EAGAIN;
+		}
+		transaction_put(owner);
+		return -EWOULDBLOCK;
 	}
 	if (transaction_status(transaction) != TRANSACTION_ACTIVE)
 		return live_transaction(transaction) ? -ECANCELED : 0;
@@ -294,6 +302,7 @@ free_node:
 static int tx_list2_acquire_entry_ref(struct tx_list2_head *head,
 				      struct tx_list2_entry_ref *ref) {
 	struct transaction *transaction = current_transaction();
+	bool should_wait = false;
 	int ret;
 
 	ret = tx_list2_acquire(head, TRANSACTION_ACCESS_READ_WRITE, NULL);
@@ -301,12 +310,18 @@ static int tx_list2_acquire_entry_ref(struct tx_list2_head *head,
 		return ret;
 
 	if (ref->transaction && ref->transaction != transaction) {
-		if (transaction_contention_manager(ref->transaction, transaction, NULL)) {
-			abort_transaction(transaction);
+		if (transaction_contention_manager(ref->transaction, transaction,
+						   &should_wait)) {
+			transaction_abort_conflict(transaction, ref->transaction,
+						   should_wait);
 			return -ECANCELED;
 		}
 
-		abort_transaction(ref->transaction);
+		ret = transaction_abort_conflict(ref->transaction, transaction, true);
+		if (ret) {
+			transaction_abort_conflict(transaction, ref->transaction, true);
+			return -ECANCELED;
+		}
 		ref->transaction = transaction;
 		ref->sentry = NULL;
 		ref->entry.transactional_state = TX_LIST2_NON_TX;

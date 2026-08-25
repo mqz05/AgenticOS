@@ -726,15 +726,22 @@ free_node:
 
 static int tx_hlist_contend_ref(struct tx_hlist_ref_state *cursor) {
 	struct transaction *transaction = tx_hlist_current_active_transaction();
+	bool should_wait = false;
 	int ret;
 
 	if (!cursor->transaction || cursor->transaction == transaction)
 		return 0;
-	if (transaction_contention_manager(cursor->transaction, transaction, NULL)) {
-		abort_transaction(transaction);
+	if (transaction_contention_manager(cursor->transaction, transaction,
+					   &should_wait)) {
+		transaction_abort_conflict(transaction, cursor->transaction,
+					   should_wait);
 		return -ECANCELED;
 	}
-	ret = abort_transaction(cursor->transaction);
+	ret = transaction_abort_conflict(cursor->transaction, transaction, true);
+	if (ret) {
+		transaction_abort_conflict(transaction, cursor->transaction, true);
+		return -ECANCELED;
+	}
 	return ret;
 }
 

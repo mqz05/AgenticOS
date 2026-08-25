@@ -309,6 +309,7 @@ void transaction_put(struct transaction * transaction) {
 	if (refcount_dec_and_test(&transaction->ref_count)) {
 		if (WARN_ON_ONCE(!transaction_workset_empty(transaction)))
 			return;
+		transaction_put(transaction->contention_winner);
 		kfree(transaction->user_regs);
 		kfree(transaction);
 	}
@@ -859,6 +860,22 @@ static int transaction_restart(struct transaction *transaction)
 	return ret;
 }
 
+/* Consume and wait on the arbitration winner after local rollback is done. */
+static int transaction_wait_for_contention_winner(struct transaction *transaction)
+{
+	struct transaction *winner;
+	bool can_wait = false;
+
+	winner = transaction_take_contention_winner(transaction, &can_wait);
+	if (!winner)
+		return 0;
+	if (!can_wait) {
+		transaction_put(winner);
+		return 0;
+	}
+	return transaction_wait_on_cleanup(winner);
+}
+
 long transaction_sys_xbegin(unsigned int flags, int __user *status) {
 	struct transaction * transaction;
 	int ret;
@@ -943,7 +960,8 @@ long transaction_sys_xend(void) {
 
 	if (ret && restore && completed) {
 		transaction_publish_status(transaction, TX_STATUS_ABORTED);
-		if (autoretry && !transaction_restart(transaction)) {
+		ret = transaction_wait_for_contention_winner(transaction);
+		if (!ret && autoretry && !transaction_restart(transaction)) {
 			transaction_publish_status(transaction, TX_STATUS_ACTIVE);
 			transaction_restore_user_regs(transaction, current_pt_regs(),
 						      transaction->count);
@@ -993,15 +1011,17 @@ long transaction_sys_xabort(void) {
 	// end_transaction() performs the actual transition back to inactive and wakes up any waiting tasks
 	ret = end_transaction(transaction);
 	if (!ret || ret == -ECANCELED) {
-		if (restore && autoretry && !transaction_restart(transaction)) {
-			transaction_publish_status(transaction, TX_STATUS_ACTIVE);
-			transaction_restore_user_regs(transaction, current_pt_regs(),
-						      transaction->count);
-			return transaction->count;
-		}
-		if (restore)
+		if (restore) {
+			ret = transaction_wait_for_contention_winner(transaction);
+			if (!ret && autoretry && !transaction_restart(transaction)) {
+				transaction_publish_status(transaction, TX_STATUS_ACTIVE);
+				transaction_restore_user_regs(transaction, current_pt_regs(),
+							      transaction->count);
+				return transaction->count;
+			}
 			transaction_restore_user_regs(transaction, current_pt_regs(),
 						      -ECANCELED);
+		}
 		transaction_detach_task(current);
 		return restore ? -ECANCELED : 0;
 	}
@@ -1027,7 +1047,8 @@ void transaction_syscall_exit(struct pt_regs *regs)
 	if (end_transaction(transaction) != -ECANCELED)
 		return;
 
-	if (autoretry && !transaction_restart(transaction)) {
+	if (!transaction_wait_for_contention_winner(transaction) && autoretry &&
+	    !transaction_restart(transaction)) {
 		transaction_publish_status(transaction, TX_STATUS_ACTIVE);
 		transaction_restore_user_regs(transaction, regs, transaction->count);
 		return;

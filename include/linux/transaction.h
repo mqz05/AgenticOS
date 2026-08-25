@@ -81,6 +81,10 @@ struct transaction {
 	size_t user_regs_size;
 	bool user_checkpoint_valid;
 
+	/* Referenced winner to wait for after this transaction rolls back. */
+	struct transaction *contention_winner;
+	bool contention_wait;
+
 	// What to do on an unsupported operation.
 	enum unsupported_behavior unsupported_operation_action;
 
@@ -183,6 +187,10 @@ struct transaction *transaction_object_conflict_get(struct transaction_object *o
 							     enum transaction_access_mode mode);
 int transaction_wait_on_conflict(struct transaction *winner);
 int transaction_wait_on_cleanup(struct transaction *winner);
+int transaction_abort_conflict(struct transaction *loser,
+			       struct transaction *winner, bool can_wait);
+struct transaction *transaction_take_contention_winner(struct transaction *transaction,
+							 bool *can_wait);
 void transaction_object_remove_ownership_locked(struct txobj_thread_list_node *node);
 void transaction_object_remove_ownership(struct txobj_thread_list_node *node);
 

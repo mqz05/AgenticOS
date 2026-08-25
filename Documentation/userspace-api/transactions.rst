@@ -24,6 +24,25 @@ policy.  ``TX_NOUSER_ROLLBACK`` selects the straight-line mode used when the
 caller does not want execution restored; in that mode ``xabort`` returns zero
 normally.
 
+Contention behavior
+===================
+
+Transactional objects track reader and writer ownership.  Conflicts between
+transactions are resolved by task priority and transaction timestamp, with
+committing transactions always winning and aborted transactions always
+losing.  A transactional loser rolls back the whole transaction; it does not
+resume halfway through the failed kernel acquisition.  When arbitration
+identifies a winning transaction, the loser retains a referenced winner,
+waits for that winner's ownership cleanup after its own rollback, and only
+then performs automatic userspace replay.
+
+Sleepable ordinary accessors wait and retry when the transactional owner wins.
+Callers already holding spin, bit, RCU, or other non-sleepable protocols must
+not sleep: adapters either perform a supported shadow-preserving takeover or
+return a failure that causes transactional rollback.  List and hlist paths
+whose speculative state cannot be taken over wait only after releasing their
+native protocol lock.
+
 The port currently restores the syscall-entry general-register frame,
 including the user instruction pointer, stack pointer, and processor flags.
 Until userspace stack rollback is added, callers that enable execution

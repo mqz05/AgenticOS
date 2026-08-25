@@ -72,6 +72,13 @@ struct transaction_list_wait_context {
 	int ret;
 };
 
+struct transaction_winner_wait_context {
+	struct transaction *winner;
+	struct completion started;
+	struct completion done;
+	int ret;
+};
+
 enum transaction_finish_test_event {
 	TRANSACTION_FINISH_BLOCKING_LOCK = 1,
 	TRANSACTION_FINISH_NONBLOCKING_LOCK,
@@ -330,6 +337,16 @@ static int transaction_list_wait_thread(void *data)
 
 	complete(&context->started);
 	context->ret = tx_list2_add_tail(context->ref, context->head);
+	complete(&context->done);
+	return 0;
+}
+
+static int transaction_winner_wait_thread(void *data)
+{
+	struct transaction_winner_wait_context *context = data;
+
+	complete(&context->started);
+	context->ret = transaction_wait_on_cleanup(context->winner);
 	complete(&context->done);
 	return 0;
 }
@@ -629,6 +646,48 @@ static void transaction_contention_committing_test(struct kunit *test) {
 	transaction_contention_cleanup(&a);
 }
 
+static void transaction_contention_winner_cleanup_wait_test(struct kunit *test)
+{
+	struct transaction_winner_wait_context context;
+	struct task_struct *wait_task;
+	struct transaction *loser;
+	struct transaction *winner;
+	bool can_wait = false;
+
+	winner = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, winner);
+	loser = transaction_alloc(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, loser);
+	KUNIT_ASSERT_EQ(test, begin_transaction(winner), 0);
+	KUNIT_ASSERT_EQ(test, begin_transaction(loser), 0);
+	KUNIT_ASSERT_EQ(test, transaction_abort_conflict(loser, winner, true), 0);
+	KUNIT_EXPECT_EQ(test, transaction_status(loser), TRANSACTION_ABORTED);
+
+	context.winner = transaction_take_contention_winner(loser, &can_wait);
+	KUNIT_ASSERT_PTR_EQ(test, context.winner, winner);
+	KUNIT_ASSERT_TRUE(test, can_wait);
+	init_completion(&context.started);
+	init_completion(&context.done);
+	context.ret = -EINPROGRESS;
+	wait_task = kthread_run(transaction_winner_wait_thread, &context,
+				"transaction-winner-wait-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wait_task);
+	KUNIT_ASSERT_NE(test,
+		wait_for_completion_timeout(&context.started, msecs_to_jiffies(1000)),
+		0UL);
+	KUNIT_EXPECT_FALSE(test, completion_done(&context.done));
+
+	KUNIT_EXPECT_EQ(test, end_transaction(winner), 0);
+	KUNIT_ASSERT_NE(test,
+		wait_for_completion_timeout(&context.done, msecs_to_jiffies(1000)),
+		0UL);
+	kthread_stop(wait_task);
+	KUNIT_EXPECT_EQ(test, context.ret, 0);
+	KUNIT_EXPECT_EQ(test, end_transaction(loser), -ECANCELED);
+	transaction_put(loser);
+	transaction_put(winner);
+}
+
 static void transaction_object_readers_test(struct kunit *test) {
 	struct transaction_contention_test_context a = { };
 	struct transaction_contention_test_context b = { };
@@ -666,6 +725,8 @@ static void transaction_object_reader_wins_test(struct kunit *test) {
 	struct transaction_object object;
 	unsigned long original;
 	bool should_sleep = false;
+	bool can_wait = false;
+	struct transaction *winner;
 
 	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
 	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &reader, 100, &writer, 120), 0);
@@ -679,6 +740,10 @@ static void transaction_object_reader_wins_test(struct kunit *test) {
 	KUNIT_EXPECT_PTR_EQ(test, object.writer, NULL);
 	KUNIT_EXPECT_FALSE(test, list_empty(&reader_node->object_list));
 	KUNIT_EXPECT_TRUE(test, list_empty(&writer_node->object_list));
+	winner = transaction_take_contention_winner(writer.transaction, &can_wait);
+	KUNIT_EXPECT_PTR_EQ(test, winner, reader.transaction);
+	KUNIT_EXPECT_TRUE(test, can_wait);
+	transaction_put(winner);
 
 	transaction_object_test_cleanup(&writer, writer_node);
 	transaction_object_test_cleanup(&reader, reader_node);
@@ -691,6 +756,8 @@ static void transaction_object_writer_wins_test(struct kunit *test) {
 	struct txobj_thread_list_node *writer_node = NULL;
 	struct transaction_object object;
 	unsigned long original;
+	bool can_wait = false;
+	struct transaction *winner;
 
 	transaction_object_init(&object, TRANSACTION_OBJECT_CUSTOM);
 	KUNIT_ASSERT_EQ(test, transaction_contention_test_init_pair(test, &reader, 120, &writer, 100), 0);
@@ -702,6 +769,10 @@ static void transaction_object_writer_wins_test(struct kunit *test) {
 	KUNIT_EXPECT_PTR_EQ(test, object.writer, writer.transaction);
 	KUNIT_EXPECT_TRUE(test, list_empty(&reader_node->object_list));
 	KUNIT_EXPECT_FALSE(test, list_empty(&writer_node->object_list));
+	winner = transaction_take_contention_winner(reader.transaction, &can_wait);
+	KUNIT_EXPECT_PTR_EQ(test, winner, writer.transaction);
+	KUNIT_EXPECT_TRUE(test, can_wait);
+	transaction_put(winner);
 
 	transaction_object_test_cleanup(&writer, writer_node);
 	transaction_object_test_cleanup(&reader, reader_node);
@@ -2713,6 +2784,7 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_contention_timestamp_test),
 	KUNIT_CASE(transaction_contention_aborted_test),
 	KUNIT_CASE(transaction_contention_committing_test),
+	KUNIT_CASE(transaction_contention_winner_cleanup_wait_test),
 	KUNIT_CASE(transaction_object_readers_test),
 	KUNIT_CASE(transaction_object_reader_wins_test),
 	KUNIT_CASE(transaction_object_writer_wins_test),

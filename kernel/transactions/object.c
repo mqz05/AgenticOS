@@ -277,7 +277,58 @@ int transaction_wait_on_cleanup(struct transaction *winner)
 }
 EXPORT_SYMBOL_GPL(transaction_wait_on_cleanup);
 
-static int transaction_object_lose(struct transaction *transaction, bool can_sleep, bool *should_sleep) {
+/* Record the arbitration winner before marking the loser aborted. */
+int transaction_abort_conflict(struct transaction *loser,
+			       struct transaction *winner, bool can_wait)
+{
+	int ret;
+
+	if (!loser || loser == winner)
+		return -EINVAL;
+	ret = abort_transaction(loser);
+	if (ret)
+		return ret;
+	if (winner)
+		transaction_get(winner);
+
+	spin_lock(&loser->lock);
+	if (winner && !loser->contention_winner) {
+		loser->contention_winner = winner;
+		loser->contention_wait = can_wait;
+		winner = NULL;
+	} else if (winner && loser->contention_winner == winner) {
+		loser->contention_wait |= can_wait;
+	}
+	spin_unlock(&loser->lock);
+	transaction_put(winner);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(transaction_abort_conflict);
+
+/* Transfer the stored winner reference to the rollback/retry path. */
+struct transaction *transaction_take_contention_winner(struct transaction *transaction,
+							 bool *can_wait)
+{
+	struct transaction *winner;
+
+	if (can_wait)
+		*can_wait = false;
+	if (!transaction)
+		return NULL;
+	spin_lock(&transaction->lock);
+	winner = transaction->contention_winner;
+	if (can_wait)
+		*can_wait = transaction->contention_wait;
+	transaction->contention_winner = NULL;
+	transaction->contention_wait = false;
+	spin_unlock(&transaction->lock);
+	return winner;
+}
+EXPORT_SYMBOL_GPL(transaction_take_contention_winner);
+
+static int transaction_object_lose(struct transaction *transaction,
+				   struct transaction *winner,
+				   bool can_sleep, bool *should_sleep) {
 	int ret;
 
 	/*
@@ -289,7 +340,7 @@ static int transaction_object_lose(struct transaction *transaction, bool can_sle
 	if (should_sleep)
 		*should_sleep = can_sleep;
 
-	ret = abort_transaction(transaction);
+	ret = transaction_abort_conflict(transaction, winner, can_sleep);
 	return ret ? ret : -ECANCELED;
 }
 
@@ -305,6 +356,7 @@ int transaction_object_acquire(struct transaction *transaction,
 	struct txobj_thread_list_node *reader;
 	struct transaction_object *object;
 	struct transaction *writer;
+	struct transaction *conflict = NULL;
 	enum transaction_state status;
 	bool can_sleep;
 	int ret = 0;
@@ -348,7 +400,8 @@ int transaction_object_acquire(struct transaction *transaction,
 
 			can_sleep = false;
 			if (transaction_contention_manager(reader->tx, transaction, &can_sleep)) {
-				ret = transaction_object_lose(transaction, can_sleep, should_sleep);
+				ret = transaction_object_lose(transaction, reader->tx,
+						      can_sleep, should_sleep);
 				goto out;
 			}
 		}
@@ -358,7 +411,8 @@ int transaction_object_acquire(struct transaction *transaction,
 	if (writer && writer != transaction) {
 		can_sleep = false;
 		if (transaction_contention_manager(writer, transaction, &can_sleep)) {
-			ret = transaction_object_lose(transaction, can_sleep, should_sleep);
+			ret = transaction_object_lose(transaction, writer,
+						      can_sleep, should_sleep);
 			goto out;
 		}
 	}
@@ -367,13 +421,15 @@ int transaction_object_acquire(struct transaction *transaction,
 		list_for_each_entry(reader, &object->readers, object_list) {
 			if (reader->tx == transaction)
 				continue;
-			ret = abort_transaction(reader->tx);
+			conflict = reader->tx;
+			ret = transaction_abort_conflict(reader->tx, transaction, can_sleep);
 			if (ret)
 				goto lost_race;
 		}
 	}
 	if (writer && writer != transaction) {
-		ret = abort_transaction(writer);
+		conflict = writer;
+		ret = transaction_abort_conflict(writer, transaction, can_sleep);
 		if (ret)
 			goto lost_race;
 	}
@@ -424,7 +480,7 @@ lost_race:
 	 * A transaction that started committing after arbitration cannot be
 	 * aborted. It wins the race, so the acquiring transaction must lose.
 	 */
-	ret = transaction_object_lose(transaction, false, should_sleep);
+	ret = transaction_object_lose(transaction, conflict, true, should_sleep);
 out:
 	spin_unlock(&object->lock);
 	return ret;
