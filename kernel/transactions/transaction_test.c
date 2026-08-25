@@ -2576,9 +2576,10 @@ static void transaction_dentry_hash_takeover_test(struct kunit *test) {
 
 static void transaction_syscall_commit_test(struct kunit *test) {
 	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
-	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
+	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(TX_NOUSER_ROLLBACK, NULL), 0L);
 	KUNIT_EXPECT_TRUE(test, live_transaction(current_transaction()));
-	KUNIT_EXPECT_EQ(test, transaction_sys_xbegin(), (long)-EALREADY);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xbegin(TX_NOUSER_ROLLBACK, NULL),
+			(long)-EALREADY);
 	KUNIT_EXPECT_EQ(test, transaction_sys_xend(), 0L);
 	KUNIT_EXPECT_PTR_EQ(test, current_transaction(), NULL);
 	KUNIT_EXPECT_EQ(test, transaction_sys_xend(), (long)-EINVAL);
@@ -2586,10 +2587,38 @@ static void transaction_syscall_commit_test(struct kunit *test) {
 
 static void transaction_syscall_abort_test(struct kunit *test) {
 	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
-	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(), 0L);
+	KUNIT_ASSERT_EQ(test, transaction_sys_xbegin(TX_NOUSER_ROLLBACK, NULL), 0L);
 	KUNIT_EXPECT_EQ(test, transaction_sys_xabort(), 0L);
 	KUNIT_EXPECT_PTR_EQ(test, current_transaction(), NULL);
 	KUNIT_EXPECT_EQ(test, transaction_sys_xabort(), (long)-EINVAL);
+}
+
+static void transaction_syscall_flags_test(struct kunit *test)
+{
+	struct transaction *transaction;
+
+	KUNIT_ASSERT_PTR_EQ(test, current_transaction(), NULL);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xbegin(1U << 31, NULL),
+			(long)-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+		transaction_sys_xbegin(TX_ERROR_UNSUPPORTED |
+				       TX_LIVE_DANGEROUSLY, NULL),
+		(long)-EINVAL);
+
+	KUNIT_ASSERT_EQ(test,
+		transaction_sys_xbegin(TX_NONDURABLE | TX_NOUSER_ROLLBACK |
+				       TX_NOAUTO_RETRY | TX_ERROR_UNSUPPORTED,
+				       NULL),
+		0L);
+	transaction = current_transaction();
+	KUNIT_ASSERT_NOT_NULL(test, transaction);
+	KUNIT_EXPECT_EQ(test, transaction->user_flags,
+			(unsigned int)(TX_NONDURABLE | TX_NOUSER_ROLLBACK |
+				       TX_NOAUTO_RETRY | TX_ERROR_UNSUPPORTED));
+	KUNIT_EXPECT_FALSE(test, transaction->autoretry);
+	KUNIT_EXPECT_EQ(test, transaction->unsupported_operation_action,
+			UNSUPPORTED_ERROR_CODE);
+	KUNIT_EXPECT_EQ(test, transaction_sys_xabort(), 0L);
 }
 
 static void transaction_live_fork_test(struct kunit *test) {
@@ -2677,6 +2706,7 @@ static struct kunit_case transaction_test_cases[] = {
 	KUNIT_CASE(transaction_dentry_hash_takeover_test),
 	KUNIT_CASE(transaction_syscall_commit_test),
 	KUNIT_CASE(transaction_syscall_abort_test),
+	KUNIT_CASE(transaction_syscall_flags_test),
 	KUNIT_CASE(transaction_live_fork_test),
 	KUNIT_CASE(transaction_commit_abort_race_test),
 	KUNIT_CASE(transaction_contention_priority_test),

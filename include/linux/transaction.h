@@ -9,6 +9,7 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/wait.h>
+#include <uapi/linux/transaction.h>
 
 #ifdef CONFIG_TRANSACTIONS
 #include <linux/skiplist.h>
@@ -23,6 +24,7 @@ struct _dentry;
 struct iattr;
 struct mnt_idmap;
 struct transaction;
+struct pt_regs;
 
 #ifdef CONFIG_TRANSACTIONS
 
@@ -71,6 +73,13 @@ struct transaction {
 
 	// Abort and return an error after an explicit abort.
 	bool abortWithErr;
+
+	/* Userspace ABI policy and the xbegin() execution checkpoint. */
+	unsigned int user_flags;
+	int __user *user_status;
+	void *user_regs;
+	size_t user_regs_size;
+	bool user_checkpoint_valid;
 
 	// What to do on an unsupported operation.
 	enum unsupported_behavior unsupported_operation_action;
@@ -249,9 +258,10 @@ bool transaction_contention_manager(struct transaction *a, struct transaction *b
 int begin_transaction(struct transaction *transaction);
 int abort_transaction(struct transaction *transaction);
 int end_transaction(struct transaction *transaction);
-long transaction_sys_xbegin(void);
+long transaction_sys_xbegin(unsigned int flags, int __user *status);
 long transaction_sys_xend(void);
 long transaction_sys_xabort(void);
+void transaction_syscall_exit(struct pt_regs *regs);
 
 void transaction_task_init(struct task_struct *task);
 int transaction_attach_task(struct transaction *transaction, struct task_struct *task);
@@ -268,6 +278,7 @@ static inline int transaction_task_fork(const struct task_struct *task) {
 static inline struct transaction *current_transaction(void) {
 	return NULL;
 }
+static inline void transaction_syscall_exit(struct pt_regs *regs) { }
 static inline void transaction_file_init(struct file *file) { }
 static inline int transaction_file_snapshot(struct file *file) {
 	return 0;

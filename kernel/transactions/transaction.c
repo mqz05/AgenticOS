@@ -5,11 +5,14 @@
 #include <linux/bug.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/sched/prio.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/transaction.h>
+#include <linux/uaccess.h>
+#include <asm/syscall.h>
 
 // The timestamp orders transactions that contend for the same object.
 static atomic64_t timestamp_counter = ATOMIC64_INIT(0);
@@ -306,6 +309,7 @@ void transaction_put(struct transaction * transaction) {
 	if (refcount_dec_and_test(&transaction->ref_count)) {
 		if (WARN_ON_ONCE(!transaction_workset_empty(transaction)))
 			return;
+		kfree(transaction->user_regs);
 		kfree(transaction);
 	}
 }
@@ -803,17 +807,89 @@ int transaction_task_fork(const struct task_struct *task) {
 
 /* Kernel-side implementation of xbegin() syscall - creates a new transaction
    and attaches the current process/thread to it. */
-long transaction_sys_xbegin(void) {
+static int transaction_publish_status(struct transaction *transaction, int status)
+{
+	if (!transaction->user_status)
+		return 0;
+	return put_user(status, transaction->user_status);
+}
+
+static int transaction_checkpoint_user_regs(struct transaction *transaction)
+{
+	struct pt_regs *regs = current_pt_regs();
+
+	if (!user_mode(regs))
+		return 0;
+
+	transaction->user_regs = kmemdup(regs, sizeof(*regs), GFP_KERNEL);
+	if (!transaction->user_regs)
+		return -ENOMEM;
+	transaction->user_regs_size = sizeof(*regs);
+	transaction->user_checkpoint_valid = true;
+	return 0;
+}
+
+static void transaction_restore_user_regs(struct transaction *transaction,
+					   struct pt_regs *regs,
+					   long xbegin_result)
+{
+	if (!transaction->user_checkpoint_valid)
+		return;
+
+	if (WARN_ON_ONCE(transaction->user_regs_size != sizeof(*regs)))
+		return;
+	memcpy(regs, transaction->user_regs, sizeof(*regs));
+	syscall_set_return_value(current, regs,
+				 xbegin_result < 0 ? xbegin_result : 0,
+				 xbegin_result < 0 ? 0 : xbegin_result);
+	/* The restored frame represents a completed xbegin(), not a restartable syscall. */
+	syscall_set_nr(current, regs, -1);
+}
+
+static int transaction_restart(struct transaction *transaction)
+{
+	unsigned int retries = transaction->count;
+	int ret;
+
+	ret = begin_transaction(transaction);
+	if (!ret) {
+		transaction->count = retries;
+		transaction->autoretry = !(transaction->user_flags & TX_NOAUTO_RETRY);
+	}
+	return ret;
+}
+
+long transaction_sys_xbegin(unsigned int flags, int __user *status) {
 	struct transaction * transaction;
 	int ret;
 
+	if (flags & ~TX_VALID_FLAGS)
+		return -EINVAL;
+	if ((flags & TX_ERROR_UNSUPPORTED) &&
+	    (flags & TX_LIVE_DANGEROUSLY))
+		return -EINVAL;
 	// Check whether current task is already part of a transaction
 	if (current_transaction())
 		return -EALREADY;
+	if (status && put_user(TX_STATUS_INACTIVE, status))
+		return -EFAULT;
 
 	transaction = transaction_alloc(GFP_KERNEL);
 	if (!transaction)
 		return -ENOMEM;
+	transaction->user_flags = flags;
+	transaction->user_status = status;
+	transaction->autoretry = !(flags & TX_NOAUTO_RETRY);
+	if (flags & TX_ERROR_UNSUPPORTED)
+		transaction->unsupported_operation_action = UNSUPPORTED_ERROR_CODE;
+	else if (flags & TX_LIVE_DANGEROUSLY)
+		transaction->unsupported_operation_action = UNSUPPORTED_LIVE_DANGEROUSLY;
+
+	ret = transaction_checkpoint_user_regs(transaction);
+	if (ret) {
+		transaction_put(transaction);
+		return ret;
+	}
 
 	// Attach current task to the newly created transaction
 	ret = transaction_attach_task(transaction, current);
@@ -821,13 +897,20 @@ long transaction_sys_xbegin(void) {
 		transaction_put(transaction);
 		return ret;
 	}
-
 	// Mark transaction as active and assign it a timestamp
 	ret = begin_transaction(transaction);
 	if (ret) {
 		transaction_detach_task(current);
 		transaction_put(transaction);
 		return ret;
+	}
+	ret = transaction_publish_status(transaction, TX_STATUS_ACTIVE);
+	if (ret) {
+		abort_transaction(transaction);
+		end_transaction(transaction);
+		transaction_detach_task(current);
+		transaction_put(transaction);
+		return -EFAULT;
 	}
 
 	// Drop original allocation reference
@@ -841,6 +924,9 @@ EXPORT_SYMBOL_GPL(transaction_sys_xbegin);
    for this process / thread and detaches it when cleanup completes. */
 long transaction_sys_xend(void) {
 	struct transaction *transaction;
+	bool restore;
+	bool autoretry;
+	bool completed;
 	int ret;
 
 	// Get the transaction currently associated with this task
@@ -850,11 +936,32 @@ long transaction_sys_xend(void) {
 
 	// Try to commit / end the current transaction
 	ret = end_transaction(transaction);
+	completed = inactive_transaction(transaction);
+	restore = transaction->user_checkpoint_valid &&
+		  !(transaction->user_flags & TX_NOUSER_ROLLBACK);
+	autoretry = !(transaction->user_flags & TX_NOAUTO_RETRY);
+
+	if (ret && restore && completed) {
+		transaction_publish_status(transaction, TX_STATUS_ABORTED);
+		if (autoretry && !transaction_restart(transaction)) {
+			transaction_publish_status(transaction, TX_STATUS_ACTIVE);
+			transaction_restore_user_regs(transaction, current_pt_regs(),
+						      transaction->count);
+			return transaction->count;
+		}
+		transaction_restore_user_regs(transaction, current_pt_regs(),
+					      -ECANCELED);
+		transaction_detach_task(current);
+		return -ECANCELED;
+	}
 	// If the transaction ended cleanly, detach the current task
 	// ret == 0 means the transaction committed successfully
 	// ret == -ECANCELED means the transaction had already been marked aborted
-	if (!ret || ret == -ECANCELED)
+	if (completed) {
+		transaction_publish_status(transaction,
+			ret ? TX_STATUS_ABORTED : TX_STATUS_INACTIVE);
 		transaction_detach_task(current);
+	}
 
 	return ret;
 }
@@ -864,33 +971,76 @@ EXPORT_SYMBOL_GPL(transaction_sys_xend);
    transaction for this process / thread, completes cleanup, and detaches it. */
 long transaction_sys_xabort(void) {
 	struct transaction *transaction;
+	bool restore;
+	bool autoretry;
 	int ret;
 
 	// Get the transaction currently associated with this task
 	transaction = current_transaction();
 	if (!transaction)
 		return -EINVAL;
+	restore = transaction->user_checkpoint_valid &&
+		  !(transaction->user_flags & TX_NOUSER_ROLLBACK);
+	autoretry = !(transaction->user_flags & TX_NOAUTO_RETRY);
 
 	// Mark current transaction as aborted
 	ret = abort_transaction(transaction);
 	if (ret)
 		return ret;
+	transaction_publish_status(transaction, TX_STATUS_ABORTED);
 
 	// abort_transaction() only marks the transaction aborted
 	// end_transaction() performs the actual transition back to inactive and wakes up any waiting tasks
 	ret = end_transaction(transaction);
 	if (!ret || ret == -ECANCELED) {
+		if (restore && autoretry && !transaction_restart(transaction)) {
+			transaction_publish_status(transaction, TX_STATUS_ACTIVE);
+			transaction_restore_user_regs(transaction, current_pt_regs(),
+						      transaction->count);
+			return transaction->count;
+		}
+		if (restore)
+			transaction_restore_user_regs(transaction, current_pt_regs(),
+						      -ECANCELED);
 		transaction_detach_task(current);
-		return 0;
+		return restore ? -ECANCELED : 0;
 	}
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(transaction_sys_xabort);
 
+/* Complete asynchronous contention aborts before returning to userspace. */
+void transaction_syscall_exit(struct pt_regs *regs)
+{
+	struct transaction *transaction = current_transaction();
+	bool autoretry;
+
+	if (!transaction || transaction_status(transaction) != TRANSACTION_ABORTED)
+		return;
+	if (!transaction->user_checkpoint_valid ||
+	    (transaction->user_flags & TX_NOUSER_ROLLBACK))
+		return;
+
+	autoretry = !(transaction->user_flags & TX_NOAUTO_RETRY);
+	transaction_publish_status(transaction, TX_STATUS_ABORTED);
+	if (end_transaction(transaction) != -ECANCELED)
+		return;
+
+	if (autoretry && !transaction_restart(transaction)) {
+		transaction_publish_status(transaction, TX_STATUS_ACTIVE);
+		transaction_restore_user_regs(transaction, regs, transaction->count);
+		return;
+	}
+
+	transaction_restore_user_regs(transaction, regs, -ECANCELED);
+	transaction_detach_task(current);
+}
+EXPORT_SYMBOL_GPL(transaction_syscall_exit);
+
 // Syscall wrapper for xbegin()
-SYSCALL_DEFINE0(xbegin) {
-	return transaction_sys_xbegin();
+SYSCALL_DEFINE2(xbegin, unsigned int, flags, int __user *, status) {
+	return transaction_sys_xbegin(flags, status);
 }
 
 // Syscall wrapper for xend()

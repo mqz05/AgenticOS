@@ -8,6 +8,7 @@
 #include <linux/sched.h>
 #include <linux/livepatch.h>
 #include <linux/resume_user_mode.h>
+#include <linux/transaction.h>
 
 #include <asm/entry-common.h>
 #include <asm/syscall.h>
@@ -163,6 +164,7 @@ static __always_inline void syscall_exit_to_user_mode_work(struct pt_regs *regs)
 	}
 
 	rseq_syscall(regs);
+	transaction_syscall_exit(regs);
 
 	/*
 	 * Do one-time syscall specific work. If these work items are

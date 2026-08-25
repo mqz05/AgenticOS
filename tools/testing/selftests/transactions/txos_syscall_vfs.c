@@ -8,6 +8,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <linux/transaction.h>
+
 #include "../kselftest.h"
 
 #ifndef __NR_xbegin
@@ -22,7 +24,8 @@
 
 static long xbegin(void)
 {
-	return syscall(__NR_xbegin);
+	/* VFS tests request the legacy straight-line explicit-abort behavior. */
+	return syscall(__NR_xbegin, TX_NOUSER_ROLLBACK | TX_NOAUTO_RETRY, NULL);
 }
 
 static long xend(void)

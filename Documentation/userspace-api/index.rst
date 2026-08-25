@@ -21,6 +21,7 @@ System calls
    ebpf/index
    ioctl/index
    mseal
+   transactions
 
 Security-related interfaces
 ===========================
